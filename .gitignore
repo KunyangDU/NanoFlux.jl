@@ -1,5 +1,5 @@
 .vscode
 data
-DS_store
+.DS_store*
 backwards
 Manifest.toml
