@@ -1,6 +1,6 @@
 using MLDatasets, MLUtils, OneHotArrays
 using Zygote, Tullio
-using ChainRulesCore, ForwardDiff
+using ChainRulesCore, ForwardDiff, Random
 using Printf, TimerOutputs
 using Metal, LoopVectorization
 using Statistics: mean
@@ -22,11 +22,17 @@ include("module/flatten.jl")
 include("module/input.jl")
 include("module/check.jl")
 include("module/utils.jl")
+include("module/initialize.jl")
 
 include("fileIO/utils.jl")
 include("fileIO/mnist.jl")
 
 include("algorithm/train.jl")
+include("algorithm/update.jl")
+include("algorithm/loss.jl")
+
+include("optimizer/SGD.jl")
+include("optimizer/Adam.jl")
 
 include("wrapper/interface.jl")
 

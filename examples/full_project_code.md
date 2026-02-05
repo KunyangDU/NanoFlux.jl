@@ -19,6 +19,10 @@ else
     reset_timer!(TO)
 end
 
+if !isdefined(@__MODULE__, :ParamsContainer)
+    const ParamsContainer = Union{NamedTuple, Tuple}
+end
+
 manualGC() = GC.gc()
 
 macro bg_str(s)
@@ -39,7 +43,7 @@ end
 ```julia
 using MLDatasets, MLUtils, OneHotArrays
 using Zygote, Tullio
-using ChainRulesCore, ForwardDiff
+using ChainRulesCore, ForwardDiff, Random
 using Printf, TimerOutputs
 using Metal, LoopVectorization
 using Statistics: mean
@@ -61,11 +65,17 @@ include("module/flatten.jl")
 include("module/input.jl")
 include("module/check.jl")
 include("module/utils.jl")
+include("module/initialize.jl")
 
 include("fileIO/utils.jl")
 include("fileIO/mnist.jl")
 
 include("algorithm/train.jl")
+include("algorithm/update.jl")
+include("algorithm/loss.jl")
+
+include("optimizer/SGD.jl")
+include("optimizer/Adam.jl")
 
 include("wrapper/interface.jl")
 
@@ -82,8 +92,96 @@ include("utils.jl")
 abstract type AbstractAlgorithm end
 abstract type AbstractInformation end
 abstract type AbstractModule end
-
+abstract type AbstractOptimizer end
+abstract type AbstractState end
 abstract type AbstractNanoTensor{T, N} <: AbstractArray{T, N} end
+
+```
+
+---
+
+## File: src/optimizer/Adam.jl
+```julia
+
+@kwdef struct Adam <: AbstractOptimizer
+    learning_rate::Float32    = 1e-3
+    beta1::Float32 = 0.9
+    beta2::Float32 = 0.999
+    eps::Float32   = 1e-8
+end
+
+mutable struct AdamState{T} <: AbstractState
+    m::T
+    v::T
+    t::Int 
+end
+
+function initialize(opt::Adam, ps::Union{NamedTuple, Tuple})
+    return map(p -> initialize(opt, p), ps)
+end
+
+function initialize(::Adam, p::AbstractArray)
+    return AdamState(
+        zeros(eltype(p), size(p)), # m
+        zeros(eltype(p), size(p)), # v
+        1                          # t (初始步数)
+    )
+end
+
+initialize(::Adam, ::Any) = nothing
+
+
+function update!(p::AbstractArray, g::AbstractArray, state::AdamState, opt::Adam)
+    m, v = state.m, state.v
+    β1, β2 = opt.beta1, opt.beta2
+    ϵ = opt.eps
+    
+
+    @. m = β1 * m + (1 - β1) * g
+    @. v = β2 * v + (1 - β2) * (g ^ 2)
+    
+    correction1 = 1 - β1 ^ state.t
+    correction2 = 1 - β2 ^ state.t
+    step_size = opt.learning_rate * sqrt(correction2) / correction1
+    
+    @. p -= step_size * m / (sqrt(v) + ϵ)
+end
+
+```
+
+---
+
+## File: src/optimizer/SGD.jl
+```julia
+
+@kwdef struct SGD <: AbstractOptimizer
+    learning_rate::Float32       = 1e-2  # 学习率
+    momentum::Float32 = 0.9   # 动量系数
+end
+mutable struct SGDState{T<:AbstractArray} <: AbstractState
+    v::T
+    t::Int
+end
+
+NoOptimizer(lr::Number) = SGD(lr = convert(Float32,lr), momentum = 0.0)
+
+function initialize(opt::SGD, ps::Union{NamedTuple, Tuple})
+    return map(p -> initialize(opt, p), ps)
+end
+
+function initialize(::SGD, p::AbstractArray)
+    return SGDState(
+        zeros(eltype(p), size(p)), # v 初始化为全 0
+        1                          # t 初始化为 1
+    )
+end
+
+initialize(::SGD, ::Any) = nothing
+
+function update!(p::AbstractArray, g::AbstractArray, state::SGDState, opt::SGD)
+    @. state.v = opt.momentum * state.v + g
+    @. p = p - opt.learning_rate * state.v
+end
 ```
 
 ---
@@ -128,7 +226,6 @@ struct SpatialTensor{D, T, N, A<:AbstractArray{T, N}} <: AbstractNanoTensor{T, N
         new{D, eltype(A), ndims(A), A}(data)
     end
 end
-
 
 struct FlatTensor{T, A<:AbstractArray{T, 2}} <: AbstractNanoTensor{T, 2}
     data::A # (Features, Batch)
@@ -266,7 +363,7 @@ for N in 1:3
 
     @eval begin
         # Mean Pooling
-        function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N})
+        function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N}, ps::ParamsContainer)
             X = x.data
             in_size = size(X)
             $(unpack_exprs...)
@@ -279,7 +376,7 @@ for N in 1:3
         end
 
         # Max Pooling
-        function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N})
+        function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N}, ps)
             X = x.data
             in_size = size(X)
             $(unpack_exprs...)
@@ -293,8 +390,8 @@ for N in 1:3
     end
 end
 
-function (l::Pool)(x::SpatialTensor)
-    return l(l.mode, x)
+function (l::Pool)(x::SpatialTensor, ps::ParamsContainer)
+    return l(l.mode, x, ps)
 end
 
 
@@ -311,28 +408,25 @@ function _fmt_shape(s)
     return string(dims)
 end
 
-_count_params(l::Any) = 0
-_count_params(l::Dense) = length(l.W) + length(l.b)
-_count_params(l::Conv)  = length(l.W) + length(l.b)
-
 function format_number(n::Int)
     return replace(string(n), r"(?<=[0-9])(?=(?:[0-9]{3})+(?![0-9]))" => ",")
 end
+
+
 ```
 
 ---
 
 ## File: src/module/sequential.jl
 ```julia
-struct Sequential <: AbstractModule
-    layers::Vector{AbstractModule}
-    function Sequential(A::AbstractVector)
-        S = new(convert(Vector{AbstractModule},A))
+struct Sequential{T} <: AbstractModule
+    layers::T
+    function Sequential(layers...)
+        S = new{typeof(layers)}(layers)
         _check(S)
         return S
     end
 end
-Sequential(layers...) = Sequential(collect(layers))
 
 Base.iterate(S::Sequential) = iterate(S.layers)
 Base.iterate(S::Sequential, state) = iterate(S.layers, state)
@@ -341,12 +435,15 @@ Base.getindex(S::Sequential, i) = getindex(S.layers, i)
 Base.lastindex(S::Sequential) = lastindex(S.layers)
 Base.eltype(::Type{Sequential}) = AbstractModule
 
-function (model::Sequential)(x)
-    for layer in model.layers
-        x = layer(x)
+
+function (model::Sequential)(x, ps::ParamsContainer)
+    for (i, layer) in enumerate(model.layers)
+        x = layer(x, ps[i])
     end
     return x
 end
+
+
 
 ```
 
@@ -364,9 +461,8 @@ struct Input <: AbstractModule
     shape::Tuple
 end
 
-(l::Input)(x) = x
+(l::Input)(x, ps::ParamsContainer) = x
 
-_count_params(l::Input) = 0
 ```
 
 ---
@@ -374,42 +470,23 @@ _count_params(l::Input) = 0
 ## File: src/module/dense.jl
 ```julia
 
-struct Dense{TW, TB, F} <: AbstractModule
-    W::TW  # (Out_Dim, In_Dim)
-    b::TB  # (Out_Dim)
+struct Dense{F} <: AbstractModule
+    in_dim::Int
+    out_dim::Int
     act::F
 end
+Dense(in::Int, out::Int, act=identity) = Dense{typeof(act)}(in, out, act)
 
-function Dense(in_dim::Int, out_dim::Int, act=identity)
+(l::Dense)(x::FlatTensor, ps::ParamsContainer) = FlatTensor(l.act.(ps.W * x.data .+ ps.b))
 
-    scale = sqrt(2.0f0 / in_dim)
-    W = randn(Float32, out_dim, in_dim) .* scale
-    
-
-    b = zeros(Float32, out_dim)
-    
-    return Dense{typeof(W), typeof(b), typeof(act)}(W, b, act)
-end
-
-
-function (l::Dense)(x::FlatTensor)
-
-    y_linear = l.W * x.data
-    y_pre_act = y_linear .+ l.b
-    
-    y = l.act.(y_pre_act)
-
-    return FlatTensor(y)
-end
-
-function (l::Dense)(x::SpatialTensor)
+function (l::Dense)(x::SpatialTensor, ps::ParamsContainer)
     raw_data = x.data
     full_size = size(raw_data)
     batch_size = full_size[end]
     
     flat_features = length(raw_data) ÷ batch_size
     
-    expected_in = size(l.W, 2)
+    expected_in = size(ps.W, 2)
     
     if flat_features != expected_in
         error(b"❌ Auto-Flatten Dimension Mismatch!\n" *
@@ -420,8 +497,41 @@ function (l::Dense)(x::SpatialTensor)
 
     flat_data = reshape(raw_data, flat_features, batch_size)
 
-    return l(FlatTensor(flat_data))
+    return l(FlatTensor(flat_data), ps::ParamsContainer)
 end
+```
+
+---
+
+## File: src/module/initialize.jl
+```julia
+
+function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
+    params_tuple = ntuple(i -> initialize(model.layers[i], rng), length(model.layers))
+    return params_tuple
+end
+
+function initialize(l::Conv{D}, rng::TaskLocalRNG = Random.default_rng()) where D
+    w_shape = (l.out_ch, l.in_ch, l.k_size...)
+    fan_in = l.in_ch * prod(l.k_size)
+    scale = sqrt(2.0 / fan_in)
+    return (
+        W = randn(rng, Float32, w_shape...) .* Float32(scale),
+        b = zeros(Float32, l.out_ch)
+    )
+end
+
+function initialize(l::Dense, rng::TaskLocalRNG = Random.default_rng())
+    scale = sqrt(2.0f0 / l.in_dim)
+    return (
+        W = randn(rng, Float32, l.out_dim, l.in_dim) .* scale,
+        b = zeros(Float32, l.out_dim)
+    )
+end
+
+initialize(::AbstractModule,rng::TaskLocalRNG) = NamedTuple()
+
+
 ```
 
 ---
@@ -439,35 +549,34 @@ end
 struct Flatten <: AbstractModule end
 
 
-function (::Flatten)(x::SpatialTensor{D}) where D
+function (::Flatten)(x::SpatialTensor{D}, ::ParamsContainer) where D
     batch_size = size(x.data)[end]
     flat_data = reshape(x.data, :, batch_size)
     return FlatTensor(flat_data)
 end
 
-function (::Flatten)(x::FlatTensor)
-    return x
-end
+(::Flatten)(x::FlatTensor, ::ParamsContainer) = x
+
 ```
 
 ---
 
 ## File: src/module/check.jl
 ```julia
-using Printf
-using Random
+
 
 """
-    _check(model::Sequential, input_shape::Tuple)
+    _check(model, input_shape)
 
-运行一次虚拟前向传播，检查层维度匹配情况，并打印详细摘要。
-input_shape: (Channel, H, W) 或 (Channel, Len) 等，不包含 Batch 维度。
+显式梯度架构下的模型检查器。
+它会通过生成临时参数并运行一次前向传播来验证形状匹配。
 """
-function _check(layers::Vector{AbstractModule},input_shape::Union{Tuple, Nothing}=nothing)
+function _check(model::Sequential, input_shape::Union{Tuple, Nothing}=nothing)
     println("="^80)
     println("Model Architecture Inspector")
     println("="^80)
 
+    layers = model.layers
     if input_shape === nothing
         if layers[1] isa Input
             input_shape = layers[1].shape
@@ -475,17 +584,20 @@ function _check(layers::Vector{AbstractModule},input_shape::Union{Tuple, Nothing
             error("Missing input_shape! \nPlease provide it as an argument OR add an Input(shape) layer at the start of your model.")
         end
     end
-    
+
     spatial_dims = length(input_shape) - 1
     if spatial_dims < 1
         error("Input shape must be at least (Channel, Len...), got $input_shape")
     end
 
-    full_shape = (input_shape..., 1)
+    full_shape = (input_shape..., 1) # Batch=1
     x_data = randn(Float32, full_shape)
-    
+
     x = SpatialTensor{spatial_dims}(x_data)
     
+    rng = Random.default_rng()
+    full_ps = initialize(model, rng) 
+
     println(@sprintf("Input Signal: %s (Batch=1)", string(size(x))))
     println("-"^80)
     @printf("%-4s %-15s %-25s %-25s %-10s\n", "ID", "Layer Type", "Input Shape", "Output Shape", "Params")
@@ -493,24 +605,24 @@ function _check(layers::Vector{AbstractModule},input_shape::Union{Tuple, Nothing
 
     total_params = 0
     
-    for (i, layer) in enumerate(layers)
+    for (i, (layer, layer_ps)) in enumerate(zip(layers, full_ps))
         layer_type = string(typeof(layer))
         layer_name = split(layer_type, "{")[1]
         in_shape = size(x)
         
         try
-            out = layer(x)
+            out = layer(x, layer_ps)
             
             out_shape = size(out)
             
-            n_params = _count_params(layer)
+            n_params = _count_elements(layer_ps)
             total_params += n_params
             
             str_in  = _fmt_shape(in_shape)
             str_out = _fmt_shape(out_shape)
             
-            @printf("%-4d %-15s %-25s %-25s %-10d\n", 
-                    i, layer_name, str_in, str_out, n_params)
+            @printf("%-4d %-15s %-25s %-25s %-10s\n", 
+                    i, layer_name, str_in, str_out, format_number(n_params))
             
             x = out
             
@@ -520,12 +632,17 @@ function _check(layers::Vector{AbstractModule},input_shape::Union{Tuple, Nothing
             println("!"^80)
             println("   Expected Input: Compatible with $(_fmt_shape(in_shape))")
             
+            
             if layer isa Dense
-                println("   Layer Config:   InputDim = $(size(layer.W, 2))")
-                println("   Analysis:       The Dense layer expects $(size(layer.W, 2)) features, but received $(in_shape[1]).")
-                println("                   (Did you calculate the Flatten output size correctly?)")
+                if haskey(layer_ps, :W)
+                    expected_dim = size(layer_ps.W, 2)
+                    println("   Layer Config:   InputDim = $expected_dim")
+                    println("   Analysis:       The Dense layer expects $expected_dim features, but received $(in_shape[1]).")
+                    println("                   (Did you calculate the Flatten output size correctly?)")
+                end
             elseif layer isa Conv
-                println("   Analysis:       Convolution failure. Check if input spatial size is smaller than Kernel size.")
+                println("   Analysis:       Convolution failure.")
+                println("                   Check if input spatial size is smaller than Kernel size.")
             end
             
             println("\nERROR DETAIL:")
@@ -541,7 +658,11 @@ function _check(layers::Vector{AbstractModule},input_shape::Union{Tuple, Nothing
     println("="^80)
 end
 
-_check(model::Sequential) = _check(model.layers)
+_check(layers::Vector{<:AbstractModule}, input_shape::Union{Tuple, Nothing}=nothing) = _check(Sequential(layers...), input_shape)
+
+_count_elements(x::Union{NamedTuple, Tuple}) = sum(_count_elements, x; init=0)
+_count_elements(x::AbstractArray) = length(x)
+_count_elements(x::Any) = 0
 ```
 
 ---
@@ -549,28 +670,20 @@ _check(model::Sequential) = _check(model.layers)
 ## File: src/module/convolution.jl
 ```julia
 
-struct Conv{D, TW, TB, F} <: AbstractModule
-    W::TW
-    b::TB
+struct Conv{D, F} <: AbstractModule
+    in_ch::Int   # 需要记录这些以进行初始化
+    out_ch::Int
+    k_size::NTuple{D, Int}
     stride::NTuple{D, Int}
     dilation::NTuple{D, Int}
     act::F
 end
 
 function Conv(D::Int, in_ch::Int, out_ch::Int, k_size::Union{Int, NTuple}; stride=1, dilation=1, act=identity)
-
     ks = k_size isa Int ? ntuple(_->k_size, D) : k_size
     st = stride isa Int ? ntuple(_->stride, D) : stride
     di = dilation isa Int ? ntuple(_->dilation, D) : dilation
-    
-    w_shape = (out_ch, in_ch, ks...)
-
-    fan_in = in_ch * prod(ks)
-    scale = sqrt(2.0 / fan_in)
-    W = randn(Float32, w_shape...) .* Float32(scale)
-    b = zeros(Float32, out_ch)
-    
-    return Conv{D, typeof(W), typeof(b), typeof(act)}(W, b, st, di, act)
+    return Conv{D, typeof(act)}(in_ch, out_ch, ks, st, di, act)
 end
 
 for N in 1:3
@@ -581,7 +694,7 @@ for N in 1:3
     for d in 1:N
         push!(unpack_exprs, :($(Symbol("s_$d")) = l.stride[$d]))
         push!(unpack_exprs, :($(Symbol("d_$d")) = l.dilation[$d]))
-        push!(unpack_exprs, :($(Symbol("ksize_$d")) = size(l.W, $d + 2)))
+        push!(unpack_exprs, :($(Symbol("ksize_$d")) = size(ps.W, $d + 2)))
     end
     
     access_exprs = map(1:N) do d
@@ -603,10 +716,10 @@ for N in 1:3
     left_side = :(y[o, $(input_idxs...), b])
     
     @eval begin
-        function (l::Conv{$N})(x::SpatialTensor{$N})
+        function (l::Conv{$N})(x::SpatialTensor{$N}, ps::ParamsContainer)
             X = x.data
-            W = l.W
-            b_vec = l.b
+            W = ps.W
+            b_vec = ps.b
             in_size = size(X)
             
             $(unpack_exprs...)
@@ -626,18 +739,40 @@ end
 
 ---
 
+## File: src/algorithm/loss.jl
+```julia
+function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+    y_pred = model(x, ps)
+    logits = y_pred.data
+    logits_safe = logits .- maximum(logits, dims=1)
+    probs = exp.(logits_safe) ./ sum(exp.(logits_safe), dims=1)
+    return -sum(y .* log.(probs .+ 1e-10)) / size(logits, 2)
+end
+
+function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+    y_pred = model(x, ps)
+    logits = y_pred.data
+    pred_idx = [c[1] for c in argmax(logits, dims=1)]
+    true_idx = [c[1] for c in argmax(y, dims=1)]
+    return mean(pred_idx .== true_idx)
+end
+```
+
+---
+
 ## File: src/algorithm/train.jl
 ```julia
 
-function train!(model::AbstractModule, train_loader, algo::SimpleAlgorithm)
+function train!(model::AbstractModule, train_loader::DataLoader, opt::AbstractOptimizer, config::TrainerConfig)
 
+    ps = initialize(model)
     history = TrainingHistory()
-    velocities = _initial_velocities(model)
+    opt_state = initialize(opt, ps)
     manualGC()
 
     total_loaders = length(train_loader)
 
-    for epoch in 1:algo.epochs
+    for epoch in 1:config.epochs
         for (x_raw, y_raw) in train_loader
 
             @timeit TO "Data Prepare" begin
@@ -646,11 +781,9 @@ function train!(model::AbstractModule, train_loader, algo::SimpleAlgorithm)
                 y = y_raw
             end
 
-            @timeit TO "Back Propagation" begin
-                loss_val = _train_step!(model, x, y, algo, velocities, history)
-            end
+            @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history)
 
-            if algo.show_times > 0 && mod(mod(history.count - 1, total_loaders) + 1, algo.show_times) == 0
+            if config.show_times > 0 && mod(mod(history.count - 1, total_loaders) + 1, config.show_times) == 0
                 print("Epoch $(epoch) [$(mod(history.count-1, total_loaders) + 1)/$(total_loaders)] - ")
                 show(history)
             end
@@ -662,14 +795,14 @@ function train!(model::AbstractModule, train_loader, algo::SimpleAlgorithm)
 
         @timeit TO "gc" manualGC()
 
-        show(TO;title = "$(epoch) / $(algo.epochs)")
+        show(TO;title = "$(epoch) / $(config.epochs)")
         print("\n")
         show(history)
 
-        if algo.target_loss !== nothing && history.avg_loss  <= algo.target_loss
-            if history.count_loss ≥ algo.patience
+        if config.target_loss !== nothing && history.avg_loss  <= config.target_loss
+            if history.count_loss ≥ config.patience
                 println()
-                println(bg"Target Loss Reached!"," ($(history.avg_loss) <= $(algo.target_loss))")
+                println(bg"Target Loss Reached!"," ($(history.avg_loss) <= $(config.target_loss))")
                 println("Stopping training early at Epoch $epoch.")
                 break
             else
@@ -677,10 +810,10 @@ function train!(model::AbstractModule, train_loader, algo::SimpleAlgorithm)
             end
         end
 
-        if algo.target_acc !== nothing && history.avg_acc >= algo.target_acc
-            if history.count_acc ≥ algo.patience
+        if config.target_acc !== nothing && history.avg_acc >= config.target_acc
+            if history.count_acc ≥ config.patience
                 println()
-                println(bg"Target Accuracy Reached!"," ($(history.avg_acc) >= $(algo.target_acc))")
+                println(bg"Target Accuracy Reached!"," ($(history.avg_acc) >= $(config.target_acc))")
                 println("Stopping training early at Epoch $epoch.")
                 break
             else
@@ -696,87 +829,41 @@ function train!(model::AbstractModule, train_loader, algo::SimpleAlgorithm)
 end
 
 
-function _train_step!(model::AbstractModule, x, y, 
-                      algo::SimpleAlgorithm, 
-                      velocities::IdDict, 
-                      history::TrainingHistory)
-    
-    ps = _params(model)
+function _train_step!(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, 
+                        ps::ParamsContainer,
+                        opt_state::ParamsContainer,
+                        opt::AbstractOptimizer,
+                        history::TrainingHistory)
 
-    loss_val, gs = @timeit TO "calc gradient" Zygote.withgradient(ps) do
-        loss(model, x, y)
-    end
+    @timeit TO "calc gradient" loss_val, grads = Zygote.withgradient(p -> loss(model, x, y, p), ps)
 
-    @timeit TO "update" for p in ps
-        if gs[p] !== nothing
-            g = gs[p]
-
-            v = get!(velocities, p, zeros(eltype(p), size(p)))
-
-            @. v = algo.momentum * v + g
-            @. p -= algo.learning_rate * v
-        end
-    end
+    @timeit TO "update!" update!(ps, grads[1], opt_state, opt)
 
     if isdefined(history, :loss)
         push!(history.loss, loss_val)
-        push!(history.accuracy, accuracy(model, x, y))
+        push!(history.accuracy, accuracy(model, x, y, ps))
     end
-    
-    return loss_val
+
 end
 
-function _initial_velocities(model::AbstractModule)
-    velocities = IdDict()
-    ps = _params(model)
-    for p in ps
-        velocities[p] = zeros(eltype(p), size(p))
+
+
+```
+
+---
+
+## File: src/algorithm/update.jl
+```julia
+
+function update!(ps::ParamsContainer, gs::ParamsContainer, states::ParamsContainer, opt::AbstractOptimizer)
+    map(ps, gs, states) do p, g, s
+        update!(p, g, s, opt)
+        s isa AbstractState && (s.t += 1)
     end
-    return velocities
+    return nothing
 end
 
-function loss(model::AbstractModule, x, y)
-    y_pred = model(x)
-    logits = y_pred.data
-    logits_safe = logits .- maximum(logits, dims=1)
-    probs = exp.(logits_safe) ./ sum(exp.(logits_safe), dims=1)
-    return -sum(y .* log.(probs .+ 1e-10)) / size(logits, 2)
-end
-
-function accuracy(model::AbstractModule, x, y)
-    y_pred = model(x)
-    logits = y_pred.data
-    pred_idx = [c[1] for c in argmax(logits, dims=1)]
-    true_idx = [c[1] for c in argmax(y, dims=1)]
-    return mean(pred_idx .== true_idx)
-end
-
-"""
-    params(m::AbstractModule)
-
-返回一个 Zygote.Params 对象，包含该模块及其子模块的所有可训练参数。
-"""
-function _params(m::AbstractModule)
-    ps = Params()
-    _collect_params!(ps, m)
-    return ps
-end
-
-function _collect_params!(ps::Params, m::Sequential)
-    for layer in m.layers
-        _collect_params!(ps, layer)
-    end
-end
-
-function _collect_params!(ps::Params, m::AbstractModule)
-    if hasfield(typeof(m), :W)
-        push!(ps, m.W)
-    end
-    if hasfield(typeof(m), :b)
-        push!(ps, m.b)
-    end
-    # 其他参数
-end
+update!(::NamedTuple{(), Tuple{}}, ::Any, ::Any, opt::AbstractOptimizer) = nothing
 ```
 
 ---
@@ -790,9 +877,7 @@ end
 配置训练的超参数。
 支持关键字构建，例如: `SimpleAlgorithm(learning_rate=1e-3, epochs=20)`
 """
-@kwdef struct SimpleAlgorithm <: AbstractAlgorithm
-    learning_rate::Float32               = 1e-2
-    momentum::Float32                    = 0.9f0
+@kwdef struct TrainerConfig <: AbstractAlgorithm
     epochs::Int                          = 10
     batch_size::Int                      = 32
     show_times::Int                      = 1

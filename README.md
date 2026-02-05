@@ -11,6 +11,15 @@
     基于爱因斯坦求和约定 (Einstein Summation) 构建底层运算。每一层网络（如卷积、池化）都是可验证、可推导的显式数学公式，而非不透明的 API 调用。
 ## 支持组件
 
-* **核心容器**：`SpatialTensor{N}`, `FlatTensor`
+* **封装器**：`SpatialTensor{N}`, `FlatTensor`
 * **网络层**：`Dense`, `Conv{N}`, `Pool{N}`
+* **组合器**：`Sequential`
 * **优化器**：`SGD`, `MomentumSGD`, `Adam` 
+
+## 性能基准
+
+以下是NanoFlux在标准数据集上的测试结果：
+
+| 模型架构 | 数据集 | 准确率 | 训练耗时 | 硬件 |
+| :--- | :--- | :--- | :--- | :--- |
+| **LeNet-5** | MNIST | **> 98.0%** | ~ 50s | Apple M4 (10-Core) |

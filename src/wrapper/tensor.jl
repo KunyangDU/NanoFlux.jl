@@ -11,7 +11,6 @@ struct SpatialTensor{D, T, N, A<:AbstractArray{T, N}} <: AbstractNanoTensor{T, N
     end
 end
 
-
 struct FlatTensor{T, A<:AbstractArray{T, 2}} <: AbstractNanoTensor{T, 2}
     data::A # (Features, Batch)
 end

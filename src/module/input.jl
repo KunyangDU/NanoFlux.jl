@@ -8,6 +8,4 @@ struct Input <: AbstractModule
     shape::Tuple
 end
 
-(l::Input)(x) = x
-
-_count_params(l::Input) = 0
+(l::Input)(x, ps::ParamsContainer) = x

@@ -13,9 +13,14 @@ model = Sequential(
     Dense(84, 10, identity)
 )
 
-algo = SimpleAlgorithm(
-    learning_rate = 0.001,
-    momentum = 0.9,
+# opt = SGD(
+#     learning_rate = 0.001, 
+#     momentum = 0.9
+# )
+opt = Adam(
+    learning_rate = 0.001, 
+)
+config = TrainerConfig(
     epochs = 5,
     batch_size = 64,
     show_times = 10,
@@ -24,8 +29,8 @@ algo = SimpleAlgorithm(
     patience = 1
 )
 
-train_loader = mnist_loader(algo.batch_size)
+train_loader = mnist_loader(config.batch_size)
 
-train!(model, train_loader, algo)
+train!(model, train_loader, opt, config)
 
 

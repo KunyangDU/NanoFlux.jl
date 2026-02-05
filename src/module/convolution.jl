@@ -1,26 +1,18 @@
 
-struct Conv{D, TW, TB, F} <: AbstractModule
-    W::TW
-    b::TB
+struct Conv{D, F} <: AbstractModule
+    in_ch::Int   # 需要记录这些以进行初始化
+    out_ch::Int
+    k_size::NTuple{D, Int}
     stride::NTuple{D, Int}
     dilation::NTuple{D, Int}
     act::F
 end
 
 function Conv(D::Int, in_ch::Int, out_ch::Int, k_size::Union{Int, NTuple}; stride=1, dilation=1, act=identity)
-
     ks = k_size isa Int ? ntuple(_->k_size, D) : k_size
     st = stride isa Int ? ntuple(_->stride, D) : stride
     di = dilation isa Int ? ntuple(_->dilation, D) : dilation
-    
-    w_shape = (out_ch, in_ch, ks...)
-
-    fan_in = in_ch * prod(ks)
-    scale = sqrt(2.0 / fan_in)
-    W = randn(Float32, w_shape...) .* Float32(scale)
-    b = zeros(Float32, out_ch)
-    
-    return Conv{D, typeof(W), typeof(b), typeof(act)}(W, b, st, di, act)
+    return Conv{D, typeof(act)}(in_ch, out_ch, ks, st, di, act)
 end
 
 for N in 1:3
@@ -31,7 +23,7 @@ for N in 1:3
     for d in 1:N
         push!(unpack_exprs, :($(Symbol("s_$d")) = l.stride[$d]))
         push!(unpack_exprs, :($(Symbol("d_$d")) = l.dilation[$d]))
-        push!(unpack_exprs, :($(Symbol("ksize_$d")) = size(l.W, $d + 2)))
+        push!(unpack_exprs, :($(Symbol("ksize_$d")) = size(ps.W, $d + 2)))
     end
     
     access_exprs = map(1:N) do d
@@ -53,10 +45,10 @@ for N in 1:3
     left_side = :(y[o, $(input_idxs...), b])
     
     @eval begin
-        function (l::Conv{$N})(x::SpatialTensor{$N})
+        function (l::Conv{$N})(x::SpatialTensor{$N}, ps::ParamsContainer)
             X = x.data
-            W = l.W
-            b_vec = l.b
+            W = ps.W
+            b_vec = ps.b
             in_size = size(X)
             
             $(unpack_exprs...)

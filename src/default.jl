@@ -5,6 +5,10 @@ else
     reset_timer!(TO)
 end
 
+if !isdefined(@__MODULE__, :ParamsContainer)
+    const ParamsContainer = Union{NamedTuple, Tuple}
+end
+
 manualGC() = GC.gc()
 
 macro bg_str(s)

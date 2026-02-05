@@ -1,12 +1,11 @@
-struct Sequential <: AbstractModule
-    layers::Vector{AbstractModule}
-    function Sequential(A::AbstractVector)
-        S = new(convert(Vector{AbstractModule},A))
+struct Sequential{T} <: AbstractModule
+    layers::T
+    function Sequential(layers...)
+        S = new{typeof(layers)}(layers)
         _check(S)
         return S
     end
 end
-Sequential(layers...) = Sequential(collect(layers))
 
 Base.iterate(S::Sequential) = iterate(S.layers)
 Base.iterate(S::Sequential, state) = iterate(S.layers, state)
@@ -15,9 +14,12 @@ Base.getindex(S::Sequential, i) = getindex(S.layers, i)
 Base.lastindex(S::Sequential) = lastindex(S.layers)
 Base.eltype(::Type{Sequential}) = AbstractModule
 
-function (model::Sequential)(x)
-    for layer in model.layers
-        x = layer(x)
+
+function (model::Sequential)(x, ps::ParamsContainer)
+    for (i, layer) in enumerate(model.layers)
+        x = layer(x, ps[i])
     end
     return x
 end
+
+

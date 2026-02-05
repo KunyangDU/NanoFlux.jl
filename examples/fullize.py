@@ -1,6 +1,6 @@
 import os
 
-def merge_julia_project(src_path, output_name="full_project_code.md"):
+def merge_julia_project(src_path, output_name="examples/full_project_code.md"):
     # 允许的后缀名
     extensions = ('.jl', '.toml') 
     

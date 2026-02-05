@@ -9,12 +9,10 @@
 struct Flatten <: AbstractModule end
 
 
-function (::Flatten)(x::SpatialTensor{D}) where D
+function (::Flatten)(x::SpatialTensor{D}, ::ParamsContainer) where D
     batch_size = size(x.data)[end]
     flat_data = reshape(x.data, :, batch_size)
     return FlatTensor(flat_data)
 end
 
-function (::Flatten)(x::FlatTensor)
-    return x
-end
+(::Flatten)(x::FlatTensor, ::ParamsContainer) = x

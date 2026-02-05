@@ -53,7 +53,7 @@ for N in 1:3
 
     @eval begin
         # Mean Pooling
-        function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N})
+        function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N}, ps::ParamsContainer)
             X = x.data
             in_size = size(X)
             $(unpack_exprs...)
@@ -66,7 +66,7 @@ for N in 1:3
         end
 
         # Max Pooling
-        function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N})
+        function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N}, ps)
             X = x.data
             in_size = size(X)
             $(unpack_exprs...)
@@ -80,8 +80,8 @@ for N in 1:3
     end
 end
 
-function (l::Pool)(x::SpatialTensor)
-    return l(l.mode, x)
+function (l::Pool)(x::SpatialTensor, ps::ParamsContainer)
+    return l(l.mode, x, ps)
 end
 
 

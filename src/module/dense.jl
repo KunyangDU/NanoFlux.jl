@@ -1,40 +1,21 @@
 
-struct Dense{TW, TB, F} <: AbstractModule
-    W::TW  # (Out_Dim, In_Dim)
-    b::TB  # (Out_Dim)
+struct Dense{F} <: AbstractModule
+    in_dim::Int
+    out_dim::Int
     act::F
 end
+Dense(in::Int, out::Int, act=identity) = Dense{typeof(act)}(in, out, act)
 
-function Dense(in_dim::Int, out_dim::Int, act=identity)
+(l::Dense)(x::FlatTensor, ps::ParamsContainer) = FlatTensor(l.act.(ps.W * x.data .+ ps.b))
 
-    scale = sqrt(2.0f0 / in_dim)
-    W = randn(Float32, out_dim, in_dim) .* scale
-    
-
-    b = zeros(Float32, out_dim)
-    
-    return Dense{typeof(W), typeof(b), typeof(act)}(W, b, act)
-end
-
-
-function (l::Dense)(x::FlatTensor)
-
-    y_linear = l.W * x.data
-    y_pre_act = y_linear .+ l.b
-    
-    y = l.act.(y_pre_act)
-
-    return FlatTensor(y)
-end
-
-function (l::Dense)(x::SpatialTensor)
+function (l::Dense)(x::SpatialTensor, ps::ParamsContainer)
     raw_data = x.data
     full_size = size(raw_data)
     batch_size = full_size[end]
     
     flat_features = length(raw_data) ÷ batch_size
     
-    expected_in = size(l.W, 2)
+    expected_in = size(ps.W, 2)
     
     if flat_features != expected_in
         error(b"❌ Auto-Flatten Dimension Mismatch!\n" *
@@ -45,5 +26,5 @@ function (l::Dense)(x::SpatialTensor)
 
     flat_data = reshape(raw_data, flat_features, batch_size)
 
-    return l(FlatTensor(flat_data))
+    return l(FlatTensor(flat_data), ps::ParamsContainer)
 end
