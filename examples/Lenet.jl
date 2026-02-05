@@ -1,5 +1,5 @@
 
-include("src/NanoFlux.jl")
+include("../src/NanoFlux.jl")
 
 model = Sequential(
     Input((1, 28, 28)), 

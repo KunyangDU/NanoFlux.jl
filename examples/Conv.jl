@@ -1,4 +1,4 @@
-include("src/NanoFlux.jl")
+include("../src/NanoFlux.jl")
 # 单独训练一个卷积层
 
 function loss(model::Conv, x, y)

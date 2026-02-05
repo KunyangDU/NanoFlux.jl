@@ -1,4 +1,4 @@
-include("src/NanoFlux.jl")
+include("../src/NanoFlux.jl")
 # 单独训练一个全连接层
 
 function test_single_dense()
