@@ -1,11 +1,16 @@
-# NanoFlux.jl
+# NanoFlux.jl 
 
-> **A minimalist, first-principles deep learning framework built on TensorKit.jl and Zygote.jl.**
+> **从第一性原理出发基于[Tullio.jl](https://github.com/mcabbott/Tullio.jl)、[Zygote.jl](https://github.com/FluxML/Zygote.jl)构建的极简深度学习框架。**
 
-**NanoFlux** 是一个基于 `TensorKit.jl` 和 `Zygote.jl` 从零构建的极简深度学习框架。它不依赖黑盒算子，而是将神经网络层视为严谨的线性映射（TensorMap），通过手写几何变换（Im2Col）和显式梯度流，展示了深度学习的底层数学本质。
+## 核心特性
 
-## Versatility
-Following layers are supported:
-- Dense
-- Convolution
-- Pooling
+* **严格的维度安全 (Strict Dimensional Safety)**
+    通过类型系统（`SpatialTensor` vs `FlatTensor`）强制区分“空间数据”与“特征向量”。在编译期即阻断非法的张量缩并操作，从根本上消除了维度失配（Shape Mismatch）带来的隐患。
+
+* **透明的数学内核 (Transparent Mathematical Kernels)**
+    基于爱因斯坦求和约定 (Einstein Summation) 构建底层运算。每一层网络（如卷积、池化）都是可验证、可推导的显式数学公式，而非不透明的 API 调用。
+## 支持组件
+
+* **核心容器**：`SpatialTensor{N}`, `FlatTensor`
+* **网络层**：`Dense`, `Conv{N}`, `Pool{N}`
+* **优化器**：`SGD`, `MomentumSGD`, `Adam` 

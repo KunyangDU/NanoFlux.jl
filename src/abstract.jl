@@ -1,3 +1,6 @@
-abstract type AbstractLayer end
+
 abstract type AbstractAlgorithm end
 abstract type AbstractInformation end
+abstract type AbstractModule end
+
+abstract type AbstractNanoTensor{T, N} <: AbstractArray{T, N} end
