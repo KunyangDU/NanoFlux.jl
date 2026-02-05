@@ -1,8 +1,8 @@
 using MLDatasets, MLUtils, OneHotArrays
-using Zygote, Tullio
-using ChainRulesCore, ForwardDiff, Random
+using Zygote, NNlib
+using Random
 using Printf, TimerOutputs
-using Metal, LoopVectorization
+using Metal
 using Statistics: mean
 
 include("default.jl")

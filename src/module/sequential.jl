@@ -15,11 +15,20 @@ Base.lastindex(S::Sequential) = lastindex(S.layers)
 Base.eltype(::Type{Sequential}) = AbstractModule
 
 
-function (model::Sequential)(x, ps::ParamsContainer)
-    for (i, layer) in enumerate(model.layers)
-        x = layer(x, ps[i])
-    end
-    return x
+# function (model::Sequential)(x, ps::ParamsContainer)
+#     for (i, layer) in enumerate(model.layers)
+#         x = layer(x, ps[i])
+#     end
+#     return x
+# end
+
+@inline function chain(x, layers::Tuple, ps::Union{Tuple, NamedTuple})
+    layer = layers[1]
+    p = ps[1]
+    out = layer(x, p)
+    return chain(out, Base.tail(layers), Base.tail(ps))
 end
 
+@inline chain(x, ::Tuple{}, ::Union{Tuple, NamedTuple}) = x
 
+(model::Sequential)(x, ps::Union{Tuple, NamedTuple}) = chain(x, model.layers, ps)

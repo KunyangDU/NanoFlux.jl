@@ -1,8 +1,14 @@
 using InteractiveUtils
-# 构造假数据和参数
-l = Dense(64, 10, identity)
-ps = initialize(l)
-x = FlatTensor(randn(Float32, 64, 32))
+# 构造一个假模型和假数据
+model = Sequential(
+    Input(28,28,1),
+    Conv(2, 1, 6, 5),
+    Pool(2, 2),
+    Flatten(),
+    Dense(6*12*12, 10)
+)
+ps = initialize(model)
+x = SpatialTensor{2}(randn(Float32, 28, 28, 1, 1))
 
-# 检查前向传播是否有红色字体的 Any
-@code_warntype l(x, ps)
+# 检查类型稳定性
+@code_warntype model(x, ps)

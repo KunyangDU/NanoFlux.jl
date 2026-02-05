@@ -42,10 +42,10 @@ end
 ## File: src/NanoFlux.jl
 ```julia
 using MLDatasets, MLUtils, OneHotArrays
-using Zygote, Tullio
-using ChainRulesCore, ForwardDiff, Random
+using Zygote, NNlib
+using Random
 using Printf, TimerOutputs
-using Metal, LoopVectorization
+using Metal
 using Statistics: mean
 
 include("default.jl")
@@ -194,7 +194,7 @@ end
 """
 function mnist_loader(batch_size::Int)
     train_x_raw, train_y_raw = MNIST(split=:train)[:]
-    x_reshaped = reshape(train_x_raw, 1, 28, 28, :)
+    x_reshaped = reshape(train_x_raw, 28, 28, 1, :)
     x_data = Float32.(x_reshaped)
     y_oh = onehotbatch(train_y_raw, 0:9)
     y_data = Float32.(y_oh)
@@ -220,7 +220,7 @@ end
 # D: 空间维度数 (例如 3D卷积 D=3)
 # N: 总维度数 (自动推导为 D + 2)
 struct SpatialTensor{D, T, N, A<:AbstractArray{T, N}} <: AbstractNanoTensor{T, N}
-    data::A # (Channel, D1, D2, ... , Batch)
+    data::A # (Spatial..., Channel, Batch)
     function SpatialTensor{D}(data::A) where {D, A}
         @assert ndims(A) == D + 2 "SpatialTensor{$D} 需要 $(D+2) 维数据: (Channel, Spatial..., Batch)"
         new{D, eltype(A), ndims(A), A}(data)
@@ -326,65 +326,16 @@ function Pool(D::Int, k::Union{Int, NTuple};
 end
 
 for N in 1:3
-    out_idx = [Symbol("x_$d") for d in 1:N] # 输出索引 x_1
-    red_idx = [Symbol("i_$d") for d in 1:N] # 归约索引 i_1
-    
-    unpack_exprs = []
-    for d in 1:N
-        push!(unpack_exprs, :($(Symbol("s_$d")) = l.stride[$d]))
-        push!(unpack_exprs, :($(Symbol("k_$d")) = l.k[$d]))
-    end
-    
-    access_exprs = map(1:N) do d
-        s_sym = Symbol("s_$d")
-        
-        s_node = Expr(:$, s_sym) 
-        
-        sub_node = :($(out_idx[d]) - 1)
-        
-        mult_node = Expr(:call, :*, sub_node, s_node)
-        
-        final_node = Expr(:call, :+, mult_node, red_idx[d])
-        
-        return final_node
-    end
-    
-    size_calc_exprs = [
-        :($(Symbol("out_dim_$d")) = (in_size[$d+1] - $(Symbol("k_$d"))) ÷ $(Symbol("s_$d")) + 1)
-        for d in 1:N
-    ]
-    
-    ranges_list = []
-    for d in 1:N
-        push!(ranges_list, :($(out_idx[d]) in 1:$(Symbol("out_dim_$d"))))
-        push!(ranges_list, :($(red_idx[d]) in 1:$(Symbol("k_$d"))))
-    end
-    ranges_tuple = Expr(:tuple, ranges_list...) # 拼成 (r1, r2...)
-
     @eval begin
         # Mean Pooling
         function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N}, ps::ParamsContainer)
-            X = x.data
-            in_size = size(X)
-            $(unpack_exprs...)
-            $(size_calc_exprs...)
-            
-            # @tullio y[c, $(out_idx...), b] := mean(X[c, $(access_exprs...), b]) $ranges_tuple
-            @tullio y[c, $(out_idx...), b] := mean(X[c, $(access_exprs...), b]) $ranges_tuple grad=Dual
-
+            y = NNlib.meanpool(x.data, l.k; stride=l.stride)
             return SpatialTensor{$N}(y)
         end
 
         # Max Pooling
         function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N}, ps)
-            X = x.data
-            in_size = size(X)
-            $(unpack_exprs...)
-            $(size_calc_exprs...)
-            
-            # @tullio y[c, $(out_idx...), b] := maximum(X[c, $(access_exprs...), b]) $ranges_tuple
-            @tullio y[c, $(out_idx...), b] := maximum(X[c, $(access_exprs...), b]) $ranges_tuple grad=Dual
-            
+            y = NNlib.maxpool(x.data, l.k; stride=l.stride)
             return SpatialTensor{$N}(y)
         end
     end
@@ -436,14 +387,23 @@ Base.lastindex(S::Sequential) = lastindex(S.layers)
 Base.eltype(::Type{Sequential}) = AbstractModule
 
 
-function (model::Sequential)(x, ps::ParamsContainer)
-    for (i, layer) in enumerate(model.layers)
-        x = layer(x, ps[i])
-    end
-    return x
+# function (model::Sequential)(x, ps::ParamsContainer)
+#     for (i, layer) in enumerate(model.layers)
+#         x = layer(x, ps[i])
+#     end
+#     return x
+# end
+
+@inline function chain(x, layers::Tuple, ps::Union{Tuple, NamedTuple})
+    layer = layers[1]
+    p = ps[1]
+    out = layer(x, p)
+    return chain(out, Base.tail(layers), Base.tail(ps))
 end
 
+@inline chain(x, ::Tuple{}, ::Union{Tuple, NamedTuple}) = x
 
+(model::Sequential)(x, ps::Union{Tuple, NamedTuple}) = chain(x, model.layers, ps)
 
 ```
 
@@ -460,7 +420,7 @@ end
 struct Input <: AbstractModule
     shape::Tuple
 end
-
+Input(ds...) = Input(Tuple(ds))
 (l::Input)(x, ps::ParamsContainer) = x
 
 ```
@@ -512,9 +472,10 @@ function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
 end
 
 function initialize(l::Conv{D}, rng::TaskLocalRNG = Random.default_rng()) where D
-    w_shape = (l.out_ch, l.in_ch, l.k_size...)
+    w_shape = (l.k_size..., l.in_ch, l.out_ch) 
     fan_in = l.in_ch * prod(l.k_size)
     scale = sqrt(2.0 / fan_in)
+    
     return (
         W = randn(rng, Float32, w_shape...) .* Float32(scale),
         b = zeros(Float32, l.out_ch)
@@ -686,50 +647,21 @@ function Conv(D::Int, in_ch::Int, out_ch::Int, k_size::Union{Int, NTuple}; strid
     return Conv{D, typeof(act)}(in_ch, out_ch, ks, st, di, act)
 end
 
-for N in 1:3
-    input_idxs = [Symbol("x_$d") for d in 1:N] # 输出坐标: x_1, x_2
-    kern_idxs  = [Symbol("k_$d") for d in 1:N] # 核坐标: k_1, k_2
-
-    unpack_exprs = []
-    for d in 1:N
-        push!(unpack_exprs, :($(Symbol("s_$d")) = l.stride[$d]))
-        push!(unpack_exprs, :($(Symbol("d_$d")) = l.dilation[$d]))
-        push!(unpack_exprs, :($(Symbol("ksize_$d")) = size(ps.W, $d + 2)))
-    end
-    
-    access_exprs = map(1:N) do d
-        s_sym = Symbol("s_$d")
-        d_sym = Symbol("d_$d")
-
-        :(( $(input_idxs[d]) - 1 ) * $(Expr(:$, s_sym)) + ( $(kern_idxs[d]) - 1 ) * $(Expr(:$, d_sym)) + 1)
-    end
-
-    # H_out = (H_in - dilation*(k-1) - 1) ÷ stride + 1
-    size_calc_exprs = [
-        :($(Symbol("out_dim_$d")) = (in_size[$d+1] - ($(Symbol("d_$d")) * ($(Symbol("ksize_$d")) - 1) + 1)) ÷ $(Symbol("s_$d")) + 1)
-        for d in 1:N
-    ]
-
-    # (x_1 in 1:out_dim_1, x_2 in 1:out_dim_2)
-    ranges = Expr(:tuple, [ :($(input_idxs[d]) in 1:$(Symbol("out_dim_$d"))) for d in 1:N ]...)
-
-    left_side = :(y[o, $(input_idxs...), b])
-    
+for N in 1:3    
     @eval begin
         function (l::Conv{$N})(x::SpatialTensor{$N}, ps::ParamsContainer)
-            X = x.data
-            W = ps.W
-            b_vec = ps.b
-            in_size = size(X)
+            y = NNlib.conv(x.data, ps.W; stride=l.stride, dilation=l.dilation, pad=0)
             
-            $(unpack_exprs...)
-            $(size_calc_exprs...)
-            @tullio $left_side := W[o, c, $(kern_idxs...)] * X[c, $(access_exprs...), b] $ranges
+            # 处理 Bias
+            # y 的形状是 (W_out, H_out, C_out, B)
+            # ps.b 的形状是 (C_out,)
+            # 我们需要将 b reshape 为 (1, 1, C_out, 1) 才能正确广播
             
-            bias_shape = (length(b_vec), $(ones(Int, N)...), 1)
-            y = y .+ reshape(b_vec, bias_shape)
+            # 生成 reshape 维度: 前面 N 个 1，中间是 C，最后是 1
+            # 例如 2D 卷积: (1, 1, C_out, 1)
+            bias_shape = (ntuple(_->1, $N)..., length(ps.b), 1)
             
-            return SpatialTensor{$N}(l.act.(y))
+            return SpatialTensor{$N}(l.act.(y .+ reshape(ps.b, bias_shape)))
         end
     end
 end

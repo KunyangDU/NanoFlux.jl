@@ -7,5 +7,5 @@
 struct Input <: AbstractModule
     shape::Tuple
 end
-
+Input(ds...) = Input(Tuple(ds))
 (l::Input)(x, ps::ParamsContainer) = x

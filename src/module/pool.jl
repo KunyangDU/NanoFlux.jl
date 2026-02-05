@@ -16,65 +16,16 @@ function Pool(D::Int, k::Union{Int, NTuple};
 end
 
 for N in 1:3
-    out_idx = [Symbol("x_$d") for d in 1:N] # 输出索引 x_1
-    red_idx = [Symbol("i_$d") for d in 1:N] # 归约索引 i_1
-    
-    unpack_exprs = []
-    for d in 1:N
-        push!(unpack_exprs, :($(Symbol("s_$d")) = l.stride[$d]))
-        push!(unpack_exprs, :($(Symbol("k_$d")) = l.k[$d]))
-    end
-    
-    access_exprs = map(1:N) do d
-        s_sym = Symbol("s_$d")
-        
-        s_node = Expr(:$, s_sym) 
-        
-        sub_node = :($(out_idx[d]) - 1)
-        
-        mult_node = Expr(:call, :*, sub_node, s_node)
-        
-        final_node = Expr(:call, :+, mult_node, red_idx[d])
-        
-        return final_node
-    end
-    
-    size_calc_exprs = [
-        :($(Symbol("out_dim_$d")) = (in_size[$d+1] - $(Symbol("k_$d"))) ÷ $(Symbol("s_$d")) + 1)
-        for d in 1:N
-    ]
-    
-    ranges_list = []
-    for d in 1:N
-        push!(ranges_list, :($(out_idx[d]) in 1:$(Symbol("out_dim_$d"))))
-        push!(ranges_list, :($(red_idx[d]) in 1:$(Symbol("k_$d"))))
-    end
-    ranges_tuple = Expr(:tuple, ranges_list...) # 拼成 (r1, r2...)
-
     @eval begin
         # Mean Pooling
         function (l::Pool{$N})(::typeof(mean), x::SpatialTensor{$N}, ps::ParamsContainer)
-            X = x.data
-            in_size = size(X)
-            $(unpack_exprs...)
-            $(size_calc_exprs...)
-            
-            # @tullio y[c, $(out_idx...), b] := mean(X[c, $(access_exprs...), b]) $ranges_tuple
-            @tullio y[c, $(out_idx...), b] := mean(X[c, $(access_exprs...), b]) $ranges_tuple grad=Dual
-
+            y = NNlib.meanpool(x.data, l.k; stride=l.stride)
             return SpatialTensor{$N}(y)
         end
 
         # Max Pooling
         function (l::Pool{$N})(::typeof(maximum), x::SpatialTensor{$N}, ps)
-            X = x.data
-            in_size = size(X)
-            $(unpack_exprs...)
-            $(size_calc_exprs...)
-            
-            # @tullio y[c, $(out_idx...), b] := maximum(X[c, $(access_exprs...), b]) $ranges_tuple
-            @tullio y[c, $(out_idx...), b] := maximum(X[c, $(access_exprs...), b]) $ranges_tuple grad=Dual
-            
+            y = NNlib.maxpool(x.data, l.k; stride=l.stride)
             return SpatialTensor{$N}(y)
         end
     end

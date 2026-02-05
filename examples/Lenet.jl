@@ -2,7 +2,7 @@
 include("../src/NanoFlux.jl")
 
 model = Sequential(
-    Input((1, 28, 28)), 
+    Input(28, 28, 1), 
     Conv(2, 1, 6, 5; stride=1, act=relu),
     Pool(2, 2; stride=2, mode=maximum),
     Conv(2, 6, 16, 5; stride=1, act=relu),
@@ -23,7 +23,7 @@ opt = Adam(
 config = TrainerConfig(
     epochs = 5,
     batch_size = 64,
-    show_times = 10,
+    show_times = 100,
     target_loss = 0.1,
     target_acc = 0.98,
     patience = 1

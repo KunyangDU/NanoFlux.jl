@@ -5,9 +5,10 @@ function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
 end
 
 function initialize(l::Conv{D}, rng::TaskLocalRNG = Random.default_rng()) where D
-    w_shape = (l.out_ch, l.in_ch, l.k_size...)
+    w_shape = (l.k_size..., l.in_ch, l.out_ch) 
     fan_in = l.in_ch * prod(l.k_size)
     scale = sqrt(2.0 / fan_in)
+    
     return (
         W = randn(rng, Float32, w_shape...) .* Float32(scale),
         b = zeros(Float32, l.out_ch)
