@@ -21,6 +21,7 @@ include("module/pool.jl")
 include("module/flatten.jl")
 include("module/input.jl")
 include("module/check.jl")
+include("module/utils.jl")
 
 include("fileIO/utils.jl")
 include("fileIO/mnist.jl")

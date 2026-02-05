@@ -18,7 +18,10 @@ algo = SimpleAlgorithm(
     momentum = 0.9,
     epochs = 5,
     batch_size = 64,
-    show_times = 10
+    show_times = 10,
+    target_loss = 0.1,
+    target_acc = 0.98,
+    patience = 1
 )
 
 train_loader = mnist_loader(algo.batch_size)
