@@ -79,13 +79,8 @@ function (l::Position)(x::AbstractNanoTensor, ps::ParamsContainer)
         error("Sequence length ($seq_len) exceeds maximum limit ($(l.max_len)) defined in Position layer.")
     end
 
-    # 1. 切片: 取出前 seq_len 个位置的向量
-    # ps.W 形状: (Embed, Max_Len) -> 切片后: (Embed, Seq_Len)
     pos_bias = ps.W[:, 1:seq_len]
 
-    # 2. 广播加法:
-    # (Embed, Seq, Batch) + (Embed, Seq) 
-    # Julia 会自动将 pos_bias 广播到每一个 Batch 上
     return SpatialTensor{1}(x.data .+ pos_bias)
 end
 

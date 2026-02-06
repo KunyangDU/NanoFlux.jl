@@ -2,16 +2,16 @@
 > **从第一性原理出发基于 NNlib.jl 与 Zygote.jl 构建的纯 Julia 显式梯度深度学习框架。**
 ## 核心特性
 * **纯粹的函数式范式 (Purely Functional Paradigm)**:
-    采用显式梯度（Explicit Gradients）与无状态设计（Stateless）。模型结构 (struct) 仅承载超参数，权重 (ps) 被剥离为独立的参数树，彻底解耦计算与状态，完美契合 Zygote.jl 的自动微分机制。
+    采用显式梯度与无状态设计。模型结构仅承载超参数，权重 被剥离为独立的参数树，彻底解耦计算与状态，完美契合 Zygote.jl 的自动微分机制。
 
 * **原生动态图与即时执行 (Native Dynamic Graph & Define-by-Run)**:
-    依托 Zygote.jl 强大的源码级自动微分能力，完美支持 Julia 原生控制流（循环、递归、动态分支）。告别静态图的 DSL 束缚
+    依托 Zygote.jl 强大的源码级自动微分能力，完美支持 Julia 原生控制流。告别静态图的 DSL 束缚
 
 * **严格的维度安全 (Strict Dimensional Safety)**：
-    通过类型系统（SpatialTensor vs FlatTensor）强制区分“空间数据”与“特征向量”。
+    通过类型系统强制区分“空间数据”与“特征向量”。
 
 * **现代架构原生支持 (Transformer-Native)**：
-    内置 MultiHeadAttention, LayerNorm, CausalMask 及 Block 结构，原生支持 GPT 系列模型的构建与训练，不仅仅局限于简单的 CNN。
+    内置 MultiHeadAttention, LayerNorm, CausalMask 及 Block 结构，原生支持 GPT 系列模型的构建与训练。
 ## 支持组件
 - 核心张量：`SpatialTensor{N}`, `FlatTensor`
 - 网络层：`Dense`, `Conv{N}`, `Pool{N} `(Mean/Max), `Flatten`, `Attension`, `Position`, `LayerNorm`

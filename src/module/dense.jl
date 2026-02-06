@@ -25,17 +25,12 @@ function (l::Dense)(x::SpatialTensor{D}, ps::ParamsContainer) where D
     # 我们把 (Features, A, B, C...) 视为 (Features, Total_Points)
     # 这样可以用一次矩阵乘法完成所有计算，效率最高
     
-    # 1. 融合后端维度
     flat_input = reshape(raw_data, in_features, :) # (In, N)
     
-    # 2. 矩阵乘法
     # (Out, In) * (In, N) -> (Out, N)
     flat_out = ps.W * flat_input .+ ps.b
-    
-    # 3. 激活函数
     flat_act = l.act.(flat_out)
     
-    # 4. 还原形状
     # 把第一维从 In 变成 Out，后面的维度保持原样
     new_size = (l.out_dim, sz[2:end]...)
     final_data = reshape(flat_act, new_size)

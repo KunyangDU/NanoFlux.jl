@@ -23,19 +23,15 @@ end
 
 # GPT-2 / GPT-3 风格的 Forward (Pre-Norm)
 function (m::Block)(x::AbstractNanoTensor, ps::ParamsContainer)
-    # 1. 路径 A: Norm -> Attention
-    # 注意：x 保持原样进入残差，而 norm 后的数据进入计算
+
     x_norm1 = m.ln1(x, ps.ln1)
     attn_out = m.attn(x_norm1, ps.attn) # 这里的 attn 必须是 causal 的
-    
-    # 2. 残差连接 1
+
     x = x + attn_out
-    
-    # 3. 路径 B: Norm -> MLP
+
     x_norm2 = m.ln2(x, ps.ln2)
     mlp_out = m.mlp(x_norm2, ps.mlp)
-    
-    # 4. 残差连接 2
+
     return x + mlp_out
 end
 

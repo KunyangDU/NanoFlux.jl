@@ -32,14 +32,14 @@ function Attention{H}(embed_dim::Int, max_len::Int) where H
     # 即 Row index j <= Col index i。这是上三角矩阵 (Upper Triangular)。
     
 
-    # 1. 先创建一个 2D 矩阵 (Seq, Seq)
+    # 先创建一个 2D 矩阵 (Seq, Seq)
     full_matrix = ones(Bool, max_len, max_len)
     
-    # 2. 取上三角 (Keep Row <= Col, 即 Key <= Query)
+    # 取上三角 (Keep Row <= Col, 即 Key <= Query)
     # triu 作用于 2D 矩阵
     causal_mask_2d = triu(full_matrix)
     
-    # 3. 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
+    # 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
     mask = reshape(causal_mask_2d, 1, max_len, max_len)
     
     return Attention{H}(embed_dim, head_dim, scale, mask)
@@ -60,14 +60,14 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     # T = Seq, B = Batch, D = Embed
     D, T, B = size(x.data)
     
-    # 1. QKV 投影
+    # QKV 投影
     # (3D, D) * (D, T*B) -> (3D, T, B)
     # 这里我们先把 x 展平 batch 维以便矩阵乘法，或者利用 Julia 的广播乘法
     # 为了最快速度，通常合并 T 和 B 做 2D 乘法，然后再 reshape
     x_flat = reshape(x.data, D, :) # (D, T*B)
     qkv = ps.W_qkv * x_flat        # (3D, T*B)
     
-    # 2. 分割与重塑 (Split & Reshape heads)
+    # 分割与重塑 (Split & Reshape heads)
     # qkv: (3 * H * HeadDim, T * B)
     # 我们需要将其变为 (HeadDim, H, 3, T*B) 以便分割
     # 但为了后续 batched_mul 方便，我们目标形状是: (HeadDim, T, H * B)
@@ -87,12 +87,11 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     # 合并最后两个维度作为 "Batch" 给 batched_mul 使用 -> (HeadDim, T, H*B)
     batch_dim_size = H * B
     
-    # 利用 view 避免复制
     q = reshape(view(qkv_permuted, 1, :, :, :, :), l.head_dim, T, batch_dim_size)
     k = reshape(view(qkv_permuted, 2, :, :, :, :), l.head_dim, T, batch_dim_size)
     v = reshape(view(qkv_permuted, 3, :, :, :, :), l.head_dim, T, batch_dim_size)
     
-    # 3. Attention Score 计算 (Scaled Dot-Product)
+    # Attention Score 计算 (Scaled Dot-Product)
     # Score = (K^T * Q) * scale
     # K: (Dh, T, BatchAll) -> K^T 实际上是指空间维度的转置
     # 我们利用 NNlib.batched_mul
@@ -108,7 +107,7 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     
     attn_scores = NNlib.batched_mul(kt, q) .* l.scale # (T, T, H*B)
     
-    # 4. Causal Masking (因果遮蔽)
+    # Causal Masking (因果遮蔽)
     # attn_scores 形状 (Row=Key, Col=Query, Batch)
     # Query i 应该关注 Key 1...i
     # 即允许 Col i 访问 Row j (当 j <= i)
@@ -126,18 +125,18 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     large_neg = Float32(-1e9)
     masked_scores = attn_scores .+ (map(!, current_mask) .* large_neg)
     
-    # 5. Softmax
+    # Softmax
     # 对 dim=1 (Key 维度, 即每一列 Query 的分布) 做 softmax
     attn_probs = softmax(masked_scores, dims=1)
     
-    # 6. 加权求和
+    # 加权求和
     # Out = V * Probs
     # V: (Dh, T, Batch)
     # Probs: (T, T, Batch)
     # Out: (Dh, T, Batch) -> 每一列 Out[:, i] 是 V 的列的加权和
     y = NNlib.batched_mul(v, attn_probs)
     
-    # 7. 还原形状 (Merge Heads)
+    # 还原形状 (Merge Heads)
     # y: (HeadDim, T, H*B) -> (HeadDim, T, H, B)
     y_unflat = reshape(y, l.head_dim, T, H, B)
     
@@ -145,7 +144,7 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     y_permuted = permutedims(y_unflat, (1, 3, 2, 4)) # (HeadDim, H, T, B)
     y_merged = reshape(y_permuted, D, T * B)
     
-    # 8. 输出投影
+    # 输出投影
     output = ps.W_proj * y_merged # (D, T*B)
     
     # 最终 Reshape 回 (D, T, B) 并包装
