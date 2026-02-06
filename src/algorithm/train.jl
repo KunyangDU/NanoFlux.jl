@@ -1,16 +1,21 @@
 
-function train!(model::AbstractModule, train_loader::DataLoader, opt::AbstractOptimizer, config::TrainerConfig)
-
-    ps = initialize(model)
+function train!(model::AbstractModule, ps::ParamsContainer,
+                    train_loader::DataLoader, 
+                    opt::AbstractOptimizer, 
+                    config::TrainerConfig)
     history = TrainingHistory()
-    opt_state = initialize(opt, ps)
+    opt_state = to_device(initialize(opt, ps))
     manualGC()
 
     total_loaders = length(train_loader)
 
     for epoch in 1:config.epochs
+        history.count > config.cut_step && break
         for (x_raw, y_raw) in train_loader
-
+            history.count > config.cut_step && break
+            x_raw = to_device(x_raw)
+            y_raw = to_device(y_raw)
+            
             @timeit TO "Data Prepare" begin
                 ndims_spatial = ndims(x_raw) - 2
                 x = SpatialTensor{ndims_spatial}(x_raw)
@@ -26,8 +31,8 @@ function train!(model::AbstractModule, train_loader::DataLoader, opt::AbstractOp
 
             history.count += 1
         end 
-        history.avg_loss = mean(history.loss[end - length(train_loader) + 1:end])
-        history.avg_acc = mean(history.accuracy[end - length(train_loader) + 1:end])
+        history.avg_loss = mean(history.loss[max(1, length(history.loss) - length(train_loader) + 1):end])
+        history.avg_acc = mean(history.accuracy[max(1, length(history.accuracy) - length(train_loader) + 1):end])
 
         @timeit TO "gc" manualGC()
 
@@ -61,7 +66,7 @@ function train!(model::AbstractModule, train_loader::DataLoader, opt::AbstractOp
     show(TO)
     print("\n")
     
-    return history
+    return ps,history
 end
 
 

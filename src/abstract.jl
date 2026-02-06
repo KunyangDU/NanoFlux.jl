@@ -5,3 +5,5 @@ abstract type AbstractModule end
 abstract type AbstractOptimizer end
 abstract type AbstractState end
 abstract type AbstractNanoTensor{T, N} <: AbstractArray{T, N} end
+abstract type AbstractDataset end
+abstract type AbstractDevice end

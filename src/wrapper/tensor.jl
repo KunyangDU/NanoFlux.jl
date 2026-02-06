@@ -1,6 +1,4 @@
 
-
-
 # D: 空间维度数 (例如 3D卷积 D=3)
 # N: 总维度数 (自动推导为 D + 2)
 struct SpatialTensor{D, T, N, A<:AbstractArray{T, N}} <: AbstractNanoTensor{T, N}

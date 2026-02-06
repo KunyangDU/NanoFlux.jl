@@ -8,6 +8,7 @@
     count_acc::Int64     = 1
     avg_loss::Float64    = Inf
     avg_acc::Float64     = 0.0
+    to::TimerOutput      = TO
 end
 
 function Base.show(io::IO, h::TrainingHistory)

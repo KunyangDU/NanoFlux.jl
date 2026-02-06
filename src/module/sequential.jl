@@ -2,7 +2,7 @@ struct Sequential{T} <: AbstractModule
     layers::T
     function Sequential(layers...)
         S = new{typeof(layers)}(layers)
-        _check(S)
+        # _check(S)
         return S
     end
 end

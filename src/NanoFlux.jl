@@ -2,12 +2,13 @@ using MLDatasets, MLUtils, OneHotArrays
 using Zygote, NNlib
 using Random
 using Printf, TimerOutputs
-using Metal
 using Statistics: mean
-
-include("default.jl")
+using JLD2
+using LinearAlgebra: triu, dot
 
 include("abstract.jl")
+
+include("default.jl")
 
 include("wrapper/tensor.jl")
 
@@ -19,17 +20,20 @@ include("module/dense.jl")
 include("module/convolution.jl")
 include("module/pool.jl")
 include("module/flatten.jl")
-include("module/input.jl")
-include("module/check.jl")
+# include("module/input.jl")
+include("module/attention.jl")
+include("module/normalize.jl")
+include("module/block.jl")
+include("module/embed.jl")
 include("module/utils.jl")
 include("module/initialize.jl")
-
-include("fileIO/utils.jl")
-include("fileIO/mnist.jl")
+include("module/summary.jl")
+include("module/show.jl")
 
 include("algorithm/train.jl")
 include("algorithm/update.jl")
 include("algorithm/loss.jl")
+include("algorithm/generate.jl")
 
 include("optimizer/SGD.jl")
 include("optimizer/Adam.jl")
@@ -37,5 +41,10 @@ include("optimizer/Adam.jl")
 include("wrapper/interface.jl")
 
 include("fileIO/utils.jl")
-include("fileIO/mnist.jl")
+include("fileIO/tokenizer.jl")
+include("fileIO/lm.jl")
+include("fileIO/spatial.jl")
+
+include("gpu/move.jl")
+
 include("utils.jl")

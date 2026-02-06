@@ -1,8 +1,15 @@
 
 include("../src/NanoFlux.jl")
 
+function mnist_loader(batch_size::Int; split=:train)
+    raw_x, raw_y = MNIST(split=split)[:]
+    dataset = SpatialDataset(raw_x, raw_y; num_classes=10, add_channel_dim=true)
+    do_shuffle = (split == :train)
+    loader = DataLoader(dataset, batchsize=batch_size, shuffle=do_shuffle)
+    return loader
+end
+
 model = Sequential(
-    Input(28, 28, 1), 
     Conv(2, 1, 6, 5; stride=1, act=relu),
     Pool(2, 2; stride=2, mode=maximum),
     Conv(2, 6, 16, 5; stride=1, act=relu),
@@ -26,11 +33,14 @@ config = TrainerConfig(
     show_times = 100,
     target_loss = 0.1,
     target_acc = 0.98,
-    patience = 1
+    patience = 1,
 )
+summary(model,(28,28,1))
 
 train_loader = mnist_loader(config.batch_size)
 
-train!(model, train_loader, opt, config)
+ps,history = let ps = initialize(model)
+    train!(model, ps, train_loader, opt, config)
+end
 
 

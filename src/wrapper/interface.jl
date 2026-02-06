@@ -61,3 +61,6 @@ Base.similar(t::SpatialTensor{D}, ::Type{T}, dims::Dims) where {D, T} =
 
 Base.similar(t::FlatTensor, ::Type{T}, dims::Dims) where {T} = 
     FlatTensor(similar(t.data, T, dims))
+
+Base.:+(a::SpatialTensor{D}, b::SpatialTensor{D}) where D = SpatialTensor{D}(a.data .+ b.data)
+Base.:+(a::FlatTensor, b::FlatTensor) = FlatTensor(a.data .+ b.data)

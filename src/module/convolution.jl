@@ -19,16 +19,7 @@ for N in 1:3
     @eval begin
         function (l::Conv{$N})(x::SpatialTensor{$N}, ps::ParamsContainer)
             y = NNlib.conv(x.data, ps.W; stride=l.stride, dilation=l.dilation, pad=0)
-            
-            # 处理 Bias
-            # y 的形状是 (W_out, H_out, C_out, B)
-            # ps.b 的形状是 (C_out,)
-            # 我们需要将 b reshape 为 (1, 1, C_out, 1) 才能正确广播
-            
-            # 生成 reshape 维度: 前面 N 个 1，中间是 C，最后是 1
-            # 例如 2D 卷积: (1, 1, C_out, 1)
             bias_shape = (ntuple(_->1, $N)..., length(ps.b), 1)
-            
             return SpatialTensor{$N}(l.act.(y .+ reshape(ps.b, bias_shape)))
         end
     end

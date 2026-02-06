@@ -12,4 +12,5 @@
     target_loss::Union{Float32, Nothing} = nothing 
     target_acc::Union{Float32, Nothing}  = nothing
     patience::Int64                      = 1
+    cut_step::Number                     = Inf
 end
