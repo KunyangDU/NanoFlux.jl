@@ -27,7 +27,7 @@ function test_single_dense()
     opt = SGD(learning_rate=1e-1, momentum=0.9)
     config = TrainerConfig(epochs=10, show_times=10)
 
-    train!(model, loader, opt, config)
+    train!(model, initialize(model), loader, opt, config)
     
     println("\n", bg"✅ Single Dense Layer Test Passed!")
 end

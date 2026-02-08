@@ -42,3 +42,12 @@ function Base.show(io::IO, l::Dense)
     print(io, "Dense($(l.in_dim) => $(l.out_dim))")
     l.act != identity && print(io, ", $(l.act)")
 end
+
+
+function initialize(l::Dense, rng::TaskLocalRNG = Random.default_rng())
+    scale = sqrt(2.0f0 / l.in_dim)
+    return (
+        W = randn(rng, Float32, l.out_dim, l.in_dim) .* scale,
+        b = zeros(Float32, l.out_dim)
+    )
+end

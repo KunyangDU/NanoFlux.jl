@@ -32,3 +32,10 @@ end
 @inline chain(x, ::Tuple{}, ::Union{Tuple, NamedTuple}) = x
 
 (model::Sequential)(x, ps::Union{Tuple, NamedTuple}) = chain(x, model.layers, ps)
+
+
+
+function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
+    params_tuple = ntuple(i -> initialize(model.layers[i], rng), length(model.layers))
+    return params_tuple
+end

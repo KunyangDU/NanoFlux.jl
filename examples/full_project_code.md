@@ -73,6 +73,7 @@ include("wrapper/tensor.jl")
 include("control/algorithm.jl")
 include("control/information.jl")
 
+include("module/Identity.jl")
 include("module/sequential.jl")
 include("module/dense.jl")
 include("module/convolution.jl")
@@ -87,6 +88,12 @@ include("module/utils.jl")
 include("module/initialize.jl")
 include("module/summary.jl")
 include("module/show.jl")
+include("module/resnet.jl")
+include("module/time.jl")
+include("module/spatial.jl")
+
+include("network/UNetAttentionBlock.jl")
+include("network/UNet.jl")
 
 include("algorithm/train.jl")
 include("algorithm/update.jl")
@@ -601,19 +608,15 @@ end
 
 # GPT-2 / GPT-3 风格的 Forward (Pre-Norm)
 function (m::Block)(x::AbstractNanoTensor, ps::ParamsContainer)
-    # 1. 路径 A: Norm -> Attention
-    # 注意：x 保持原样进入残差，而 norm 后的数据进入计算
+
     x_norm1 = m.ln1(x, ps.ln1)
     attn_out = m.attn(x_norm1, ps.attn) # 这里的 attn 必须是 causal 的
-    
-    # 2. 残差连接 1
+
     x = x + attn_out
-    
-    # 3. 路径 B: Norm -> MLP
+
     x_norm2 = m.ln2(x, ps.ln2)
     mlp_out = m.mlp(x_norm2, ps.mlp)
-    
-    # 4. 残差连接 2
+
     return x + mlp_out
 end
 
@@ -625,6 +628,83 @@ function initialize(m::Block, rng::TaskLocalRNG = Random.default_rng())
         ln2  = initialize(m.ln2, rng),
         mlp  = initialize(m.mlp, rng)
     )
+end
+```
+
+---
+
+## File: src/module/identity.jl
+```julia
+"""
+    Identity()
+
+恒等映射模块。直接返回输入，不进行任何操作。
+用于残差连接中的 shortcut 分支（当输入输出维度一致时）。
+"""
+struct Identity <: AbstractModule end
+
+# 前向传播：直接返回 x
+(::Identity)(x::AbstractNanoTensor, ::ParamsContainer) = x
+
+# 初始化：没有任何参数
+initialize(::Identity, ::Any) = NamedTuple()
+
+# 打印显示
+Base.show(io::IO, ::Identity) = print(io, "Identity()")
+```
+
+---
+
+## File: src/module/resnet.jl
+```julia
+# src/module/unet_blocks.jl
+
+struct ResNetBlock <: AbstractModule
+    norm1::GroupNorm
+    conv1::Conv
+    norm2::GroupNorm
+    conv2::Conv
+    time_proj::Dense # 将时间向量投影到当前通道数
+    shortcut::Union{Conv, Identity} # 如果输入输出通道不同，需要 1x1 卷积
+end
+
+function ResNetBlock(in_ch::Int, out_ch::Int, time_dim::Int; groups=8)
+    # Shortcut 逻辑
+    shortcut = (in_ch != out_ch) ? Conv(2, in_ch, out_ch, 1) : Identity()
+    
+    return ResNetBlock(
+        GroupNorm(groups, in_ch),
+        Conv(2, in_ch, out_ch, 3, stride=1, pad=1, act=silu),
+        GroupNorm(groups, out_ch),
+        Conv(2, out_ch, out_ch, 3, stride=1, pad=1, act=silu),
+        Dense(time_dim, out_ch, silu), # 时间投影层
+        shortcut
+    )
+end
+
+# 初始化逻辑略 (对每个子模块调用 initialize)
+
+function (m::ResNetBlock)(x::SpatialTensor, t_emb::AbstractArray, ps)
+    # 1. 第一层卷积
+    h = m.conv1(m.norm1(x, ps.norm1), ps.conv1)
+    
+    # 2. 注入时间嵌入 (Scale & Shift 或 仅 Add)
+    # DDPM 论文通常直接相加: h + dense(t_emb)
+    # t_emb: (TimeDim, Batch) -> proj -> (OutCh, Batch)
+    t_proj = m.time_proj(FlatTensor(t_emb), ps.time_proj).data
+    
+    # 广播加法: (W, H, C, B) + (1, 1, C, B)
+    # 需要 reshape t_proj
+    t_proj_reshaped = reshape(t_proj, 1, 1, size(t_proj)...)
+    h = SpatialTensor{2}(h.data .+ t_proj_reshaped)
+    
+    # 3. 第二层卷积
+    h = m.conv2(m.norm2(h, ps.norm2), ps.conv2)
+    
+    # 4. 残差连接
+    sc = (m.shortcut isa Identity) ? x : m.shortcut(x, ps.shortcut)
+    
+    return h + sc
 end
 ```
 
@@ -642,6 +722,7 @@ function format_number(n::Int)
     return replace(string(n), r"(?<=[0-9])(?=(?:[0-9]{3})+(?![0-9]))" => ",")
 end
 
+silu(x) = x .* sigmoid.(x) # DDPM 标配激活函数
 
 ```
 
@@ -799,6 +880,12 @@ end
 
 (model::Sequential)(x, ps::Union{Tuple, NamedTuple}) = chain(x, model.layers, ps)
 
+
+
+function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
+    params_tuple = ntuple(i -> initialize(model.layers[i], rng), length(model.layers))
+    return params_tuple
+end
 ```
 
 ---
@@ -845,6 +932,45 @@ end
 function Base.show(io::IO, l::LayerNorm)
     print(io, "LayerNorm($(l.features))")
 end
+
+
+# 放在 src/utils.jl
+
+# 放在 src/module/normalize.jl
+# GroupNorm 实现 (简化版，将 channel 分组归一化)
+struct GroupNorm <: AbstractModule
+    num_groups::Int
+    num_channels::Int
+    eps::Float32
+end
+GroupNorm(g::Int, c::Int) = GroupNorm(g, c, 1e-5f0)
+
+function initialize(l::GroupNorm, rng)
+    return (weight = ones(Float32, l.num_channels), bias = zeros(Float32, l.num_channels))
+end
+
+function (gn::GroupNorm)(x::SpatialTensor{D}, ps) where D
+    # x: (W, H, C, B)
+    W, H, C, B = size(x)
+    G = gn.num_groups
+    @assert C % G == 0 "Channel must be divisible by groups"
+    
+    # Reshape: (W, H, C/G, G, B) -> 归一化维度: (W, H, C/G)
+    x_reshaped = reshape(x.data, W, H, div(C, G), G, B)
+    
+    # 计算均值和方差 (dims=1,2,3)
+    μ = mean(x_reshaped, dims=(1,2,3))
+    σ² = var(x_reshaped, dims=(1,2,3), mean=μ, corrected=false)
+    
+    # 归一化
+    x_norm = (x_reshaped .- μ) ./ sqrt.(σ² .+ gn.eps)
+    
+    # 还原形状并应用仿射变换 (Weight & Bias 需要 reshape 以广播)
+    x_out = reshape(x_norm, W, H, C, B)
+    w_shape = (ntuple(_->1, D)..., C, 1)
+    
+    return SpatialTensor{D}(x_out .* reshape(ps.weight, w_shape) .+ reshape(ps.bias, w_shape))
+end
 ```
 
 ---
@@ -878,17 +1004,12 @@ function (l::Dense)(x::SpatialTensor{D}, ps::ParamsContainer) where D
     # 我们把 (Features, A, B, C...) 视为 (Features, Total_Points)
     # 这样可以用一次矩阵乘法完成所有计算，效率最高
     
-    # 1. 融合后端维度
     flat_input = reshape(raw_data, in_features, :) # (In, N)
     
-    # 2. 矩阵乘法
     # (Out, In) * (In, N) -> (Out, N)
     flat_out = ps.W * flat_input .+ ps.b
-    
-    # 3. 激活函数
     flat_act = l.act.(flat_out)
     
-    # 4. 还原形状
     # 把第一维从 In 变成 Out，后面的维度保持原样
     new_size = (l.out_dim, sz[2:end]...)
     final_data = reshape(flat_act, new_size)
@@ -899,6 +1020,88 @@ end
 function Base.show(io::IO, l::Dense)
     print(io, "Dense($(l.in_dim) => $(l.out_dim))")
     l.act != identity && print(io, ", $(l.act)")
+end
+
+
+function initialize(l::Dense, rng::TaskLocalRNG = Random.default_rng())
+    scale = sqrt(2.0f0 / l.in_dim)
+    return (
+        W = randn(rng, Float32, l.out_dim, l.in_dim) .* scale,
+        b = zeros(Float32, l.out_dim)
+    )
+end
+
+```
+
+---
+
+## File: src/module/spatial.jl
+```julia
+"""
+    SpatialAttention(channels::Int; heads::Int=4, groups::Int=32)
+
+图像自注意力模块，用于处理 SpatialTensor{2} (W, H, C, B)。
+它将图像展平为序列，调用通用的 Attention，然后再还原。
+"""
+struct SpatialAttention <: AbstractModule
+    norm::GroupNorm
+    attn::Attention # 复用你重构的 Attention
+end
+
+function SpatialAttention(channels::Int; heads::Int=4, groups::Int=32)
+    # 1. 图像注意力通常不需要因果遮罩 (causal=false)
+    # 2. max_len: 此时 mask 为 nothing，max_len 不影响逻辑，但为了满足构造函数签名，
+    #    我们可以传一个典型值 (例如 32x32=1024) 或 0。
+    #    Attention 内部的 forward 会根据输入动态获取 T，所以这里传 0 是安全的。
+    return SpatialAttention(
+        GroupNorm(groups, channels),
+        Attention(channels, heads, 0; causal=false) 
+    )
+end
+
+function initialize(m::SpatialAttention, rng::TaskLocalRNG = Random.default_rng())
+    return (
+        norm = initialize(m.norm, rng),
+        attn = initialize(m.attn, rng) # 递归初始化 Attention 的参数
+    )
+end
+
+function (m::SpatialAttention)(x::SpatialTensor{D}, ps::ParamsContainer) where D
+    # x: (W, H, C, B) -> D=2
+    W, H, C, B = size(x)
+    
+    # 1. GroupNorm (DDPM 标配: Pre-Norm)
+    h = m.norm(x, ps.norm)
+    
+    # 2. 维度变换: (W, H, C, B) -> (C, W*H, B)
+    # Julia 是列优先 (Column-Major) 存储：
+    # 直接 reshape(x, :, B) 会合并 W, H, C，导致通道混杂。
+    # 我们需要先 permutedims 把 C 放到第一维。
+    # 变换路径: (W, H, C, B) -> (C, W, H, B) -> (C, W*H, B)
+    h_perm = permutedims(h.data, (3, 1, 2, 4)) 
+    h_flat_data = reshape(h_perm, C, W * H, B)
+    
+    # 3. 包装成 SpatialTensor{1} 并调用 Attention
+    # 这里的 h_seq 维度符合 Attention 的要求: (Embed, Seq, Batch)
+    h_seq = SpatialTensor{1}(h_flat_data)
+    
+    # 调用 Attention (返回也是 SpatialTensor{1})
+    attn_out_tensor = m.attn(h_seq, ps.attn)
+    attn_out_data = attn_out_tensor.data # (C, W*H, B)
+    
+    # 4. 维度还原: (C, W*H, B) -> (W, H, C, B)
+    # 先 reshape 回 (C, W, H, B)
+    out_reshaped = reshape(attn_out_data, C, W, H, B)
+    # 再 permute 回 (W, H, C, B)
+    out_perm = permutedims(out_reshaped, (2, 3, 1, 4))
+    
+    # 5. 残差连接 (x + Attention(Norm(x)))
+    # 注意: 这里的加法是 Element-wise 的，要求维度完全一致
+    return x + SpatialTensor{D}(out_perm)
+end
+
+function Base.show(io::IO, m::SpatialAttention)
+    print(io, "SpatialAttention(channels=$(m.attn.embed_dim))")
 end
 ```
 
@@ -973,24 +1176,21 @@ end
 
 
 """
-    Attention{H}(embed_dim::Int, seq_len::Int)
+    Attention(embed_dim, heads; dropout=0.0, causal=false)
 
-H: 头数 (Heads)，作为类型参数传入。
-实现标准的 Scaled Dot-Product Attention，并强制应用 Causal Mask (GPT 风格)。
-
-输入: (Embed, Seq, Batch)
-输出: (Embed, Seq, Batch)
+通用的多头注意力。
+输入形状: (Embed, Seq, Batch)
 """
 struct Attention{H} <: AbstractModule
     embed_dim::Int
     head_dim::Int
     scale::Float32
-    # 预计算的因果掩码 (1, Seq, Seq) - 使用 Bool 或 Float 都可以，这里用 Bool 方便逻辑
-    # 在 NanoGPT 中通常 Seq_Len 是固定的最大上下文长度
-    mask::Array{Bool, 3} 
+    # causal::Bool # 新增：控制是否应用因果遮罩
+    mask::Union{Nothing,Array{Bool,3}}
+    # mask 可以在 forward 时动态生成或缓存，这里为了简单先省略预计算 mask
 end
 
-function Attention{H}(embed_dim::Int, max_len::Int) where H
+function Attention{H}(embed_dim::Int, max_len::Int; causal::Bool=false) where H
     @assert embed_dim % H == 0 "Embedding dimension ($embed_dim) must be divisible by number of heads ($H)"
     head_dim = embed_dim ÷ H
     scale = Float32(1.0 / sqrt(head_dim))
@@ -1003,20 +1203,28 @@ function Attention{H}(embed_dim::Int, max_len::Int) where H
     # 我们希望 Query i 只能看见 Key j (其中 j <= i)。
     # 即 Row index j <= Col index i。这是上三角矩阵 (Upper Triangular)。
     
-
-    # 1. 先创建一个 2D 矩阵 (Seq, Seq)
-    full_matrix = ones(Bool, max_len, max_len)
+    if causal
+        # 先创建一个 2D 矩阵 (Seq, Seq)
+        full_matrix = ones(Bool, max_len, max_len)
+        
+        # 取上三角 (Keep Row <= Col, 即 Key <= Query)
+        # triu 作用于 2D 矩阵
+        causal_mask_2d = triu(full_matrix)
+        
+        # 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
+        mask = reshape(causal_mask_2d, 1, max_len, max_len)
+    else
+        mask = nothing
+    end
     
-    # 2. 取上三角 (Keep Row <= Col, 即 Key <= Query)
-    # triu 作用于 2D 矩阵
-    causal_mask_2d = triu(full_matrix)
-    
-    # 3. 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
-    mask = reshape(causal_mask_2d, 1, max_len, max_len)
-    
-    return Attention{H}(embed_dim, head_dim, scale, mask)
+    return return Attention{H}(
+        embed_dim, 
+        div(embed_dim, H), 
+        Float32(1.0 / sqrt(embed_dim / H)),
+        mask
+    )
 end
-Attention(embed_dim::Int, heads::Int, max_len::Int) = Attention{heads}(embed_dim, max_len)
+Attention(embed_dim::Int, heads::Int, max_len::Int; causal::Bool=false) = Attention{heads}(embed_dim, max_len; causal = causal)
 
 function initialize(l::Attention{H}, rng::TaskLocalRNG = Random.default_rng()) where H
     std = sqrt(2.0f0 / (5 * l.embed_dim)) # Xavier like
@@ -1026,104 +1234,69 @@ function initialize(l::Attention{H}, rng::TaskLocalRNG = Random.default_rng()) w
     )
 end
 
-
-function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
+function (l::Attention{H})(x::SpatialTensor{1}, ps::ParamsContainer) where H
     # x.data: (Embed, Seq, Batch)
     # T = Seq, B = Batch, D = Embed
     D, T, B = size(x.data)
     
-    # 1. QKV 投影
+    # QKV 投影
     # (3D, D) * (D, T*B) -> (3D, T, B)
     # 这里我们先把 x 展平 batch 维以便矩阵乘法，或者利用 Julia 的广播乘法
     # 为了最快速度，通常合并 T 和 B 做 2D 乘法，然后再 reshape
     x_flat = reshape(x.data, D, :) # (D, T*B)
     qkv = ps.W_qkv * x_flat        # (3D, T*B)
     
-    # 2. 分割与重塑 (Split & Reshape heads)
-    # qkv: (3 * H * HeadDim, T * B)
-    # 我们需要将其变为 (HeadDim, H, 3, T*B) 以便分割
-    # 但为了后续 batched_mul 方便，我们目标形状是: (HeadDim, T, H * B)
-    
-    # 这里的 reshape 稍微复杂，步骤如下：
-    # -> (HeadDim, H, 3, T, B) 
-    # -> Permute -> (3, HeadDim, T, H, B) 
-    # -> Split -> Q, K, V 都是 (HeadDim, T, H*B)
-    
     qkv_reshaped = reshape(qkv, l.head_dim, H, 3, T, B)
     
     # Permute 维度: 把 3 (QKV类别) 放到最前，把 H 和 B 放到最后准备合并
     qkv_permuted = permutedims(qkv_reshaped, (3, 1, 4, 2, 5)) # (3, HeadDim, T, H, B)
-    
-    # 此时 Q, K, V 视图分离
-    # 每一个都是 (HeadDim, T, H, B)
-    # 合并最后两个维度作为 "Batch" 给 batched_mul 使用 -> (HeadDim, T, H*B)
     batch_dim_size = H * B
     
-    # 利用 view 避免复制
     q = reshape(view(qkv_permuted, 1, :, :, :, :), l.head_dim, T, batch_dim_size)
     k = reshape(view(qkv_permuted, 2, :, :, :, :), l.head_dim, T, batch_dim_size)
     v = reshape(view(qkv_permuted, 3, :, :, :, :), l.head_dim, T, batch_dim_size)
     
-    # 3. Attention Score 计算 (Scaled Dot-Product)
-    # Score = (K^T * Q) * scale
-    # K: (Dh, T, BatchAll) -> K^T 实际上是指空间维度的转置
-    # 我们利用 NNlib.batched_mul
-    # batched_mul(A, B) 对前两维做乘法，后维是 batch
-    # 我们需要 (T, T) 的结果。
-    # K 的列是 key vector k_j. Q 的列是 query vector q_i.
-    # Score[j, i] = k_j • q_i
-    # 这等价于 K' * Q (如果把 K 看作 Matrix, 每一列是一个 Key)
-    # Matrix Transpose: (T, Dh) * (Dh, T) -> (T, T)
-    
-    # batched_transpose 将 K 从 (Dh, T, Batch) -> (T, Dh, Batch)
     kt = permutedims(k, (2, 1, 3)) 
     
     attn_scores = NNlib.batched_mul(kt, q) .* l.scale # (T, T, H*B)
-    
-    # 4. Causal Masking (因果遮蔽)
-    # attn_scores 形状 (Row=Key, Col=Query, Batch)
-    # Query i 应该关注 Key 1...i
-    # 即允许 Col i 访问 Row j (当 j <= i)
-    # j <= i 是矩阵的上三角部分 (Upper Triangular)
-    # 我们的 l.mask 已经是上三角为 1 (True)
-    
-    # 动态切片 mask 以匹配当前序列长度 T
-    current_mask = view(l.mask, 1, 1:T, 1:T) # (1, T, T)
-    
-    # 应用 Mask: False 的地方设为 -inf
-    # 广播: (T, T, H*B) + (1, T, T)
-    # 注意: Julia 的 ifelse 或直接加法。为了 Zygote 友好，通常用 + (1-mask)*(-1e9)
-    # 但这里用 fill value 比较直观
-    # 既然 mask 是 Bool (1=Keep, 0=Mask)，我们需要把 0 变成 -inf
-    large_neg = Float32(-1e9)
-    masked_scores = attn_scores .+ (map(!, current_mask) .* large_neg)
-    
-    # 5. Softmax
-    # 对 dim=1 (Key 维度, 即每一列 Query 的分布) 做 softmax
-    attn_probs = softmax(masked_scores, dims=1)
-    
-    # 6. 加权求和
-    # Out = V * Probs
-    # V: (Dh, T, Batch)
-    # Probs: (T, T, Batch)
-    # Out: (Dh, T, Batch) -> 每一列 Out[:, i] 是 V 的列的加权和
+
+    if !isnothing(l.mask)
+        current_mask = view(l.mask, 1, 1:T, 1:T) # (1, T, T)
+        large_neg = Float32(-1e9)
+        attn_scores .+= (map(!, current_mask) .* large_neg)
+    end
+
+    attn_probs = softmax(attn_scores, dims=1)
+
     y = NNlib.batched_mul(v, attn_probs)
-    
-    # 7. 还原形状 (Merge Heads)
-    # y: (HeadDim, T, H*B) -> (HeadDim, T, H, B)
-    y_unflat = reshape(y, l.head_dim, T, H, B)
-    
-    # Permute 回去: (HeadDim, H, T, B) -> 展平前两维 -> (Embed, T, B)
-    y_permuted = permutedims(y_unflat, (1, 3, 2, 4)) # (HeadDim, H, T, B)
-    y_merged = reshape(y_permuted, D, T * B)
-    
-    # 8. 输出投影
-    output = ps.W_proj * y_merged # (D, T*B)
-    
-    # 最终 Reshape 回 (D, T, B) 并包装
+    y = reshape(permutedims(reshape(y, l.head_dim, T, H, B), (1, 3, 2, 4)), D, T * B)
+
+    output = ps.W_proj * y # (D, T*B)
+
     final_out = reshape(output, D, T, B)
     return SpatialTensor{1}(final_out)
 end
+
+function (l::Attention{H})(x::SpatialTensor{2}, ps::ParamsContainer) where H
+    W, H′, C, B = size(x)
+    
+    # 检查维度匹配
+    @assert C == l.embed_dim "Input channels $C must match embed_dim $(l.embed_dim)"
+
+    # 1. (W, H, C, B) -> (C, W*H, B)
+    x_perm = permutedims(x.data, (3, 1, 2, 4))
+    x_flat = reshape(x_perm, C, W*H, B)
+    
+    # 2. 调用核心逻辑
+    out_flat = _core_attention_forward(l, SpatialTensor{1}(x_flat), ps).data
+    
+    # 3. 还原
+    out_reshaped = reshape(out_flat, C, W, H, B)
+    out_final = permutedims(out_reshaped, (2, 3, 1, 4))
+    
+    return SpatialTensor{2}(out_final)
+end
+
 
 function Base.show(io::IO, l::Attention{H}) where H
     print(io, "Attention(heads=$H, embed=$(l.embed_dim))")
@@ -1133,32 +1306,46 @@ end
 
 ---
 
+## File: src/module/time.jl
+```julia
+# 一个简单的正弦位置编码 + MLP 投影
+struct TimeEmbedding <: AbstractModule
+    dim::Int
+    mlp::Sequential
+end
+
+function TimeEmbedding(dim::Int)
+    # t -> Sinusoidal -> Dense -> SiLU -> Dense
+    return TimeEmbedding(dim, Sequential(
+        Dense(dim, dim * 4, x->x .* sigmoid.(x)), # SiLU 近似
+        Dense(dim * 4, dim)
+    ))
+end
+
+initialize(m::TimeEmbedding, rng) = initialize(m.mlp, rng)
+
+function (m::TimeEmbedding)(t::Vector{Int}, ps::ParamsContainer)
+    # 1. 正弦编码
+    half_dim = m.dim ÷ 2
+    emb_scale = log(10000f0) / (half_dim - 1)
+    emb = exp.(-Float32.(0:half_dim-1) * emb_scale) # (Half,)
+    
+    # (Half, Batch)
+    emb = reshape(emb, :, 1) .* reshape(Float32.(t)', 1, :) 
+    emb = vcat(sin.(emb), cos.(emb)) # (Dim, Batch)
+    
+    # 2. MLP 投影
+    # 需要把 FlatTensor 包装传给 Dense，或者直接调用
+    # 这里假设你的 Dense 接受 Matrix
+    # NanoFlux 的 Dense 接受 FlatTensor
+    return m.mlp(FlatTensor(emb), ps).data # 返回 Matrix
+end
+```
+
+---
+
 ## File: src/module/initialize.jl
 ```julia
-
-function initialize(model::Sequential, rng::TaskLocalRNG = Random.default_rng())
-    params_tuple = ntuple(i -> initialize(model.layers[i], rng), length(model.layers))
-    return params_tuple
-end
-
-function initialize(l::Conv{D}, rng::TaskLocalRNG = Random.default_rng()) where D
-    w_shape = (l.k_size..., l.in_ch, l.out_ch) 
-    fan_in = l.in_ch * prod(l.k_size)
-    scale = sqrt(2.0 / fan_in)
-    
-    return (
-        W = randn(rng, Float32, w_shape...) .* Float32(scale),
-        b = zeros(Float32, l.out_ch)
-    )
-end
-
-function initialize(l::Dense, rng::TaskLocalRNG = Random.default_rng())
-    scale = sqrt(2.0f0 / l.in_dim)
-    return (
-        W = randn(rng, Float32, l.out_dim, l.in_dim) .* scale,
-        b = zeros(Float32, l.out_dim)
-    )
-end
 
 initialize(::AbstractModule,rng::TaskLocalRNG) = NamedTuple()
 
@@ -1250,13 +1437,8 @@ function (l::Position)(x::AbstractNanoTensor, ps::ParamsContainer)
         error("Sequence length ($seq_len) exceeds maximum limit ($(l.max_len)) defined in Position layer.")
     end
 
-    # 1. 切片: 取出前 seq_len 个位置的向量
-    # ps.W 形状: (Embed, Max_Len) -> 切片后: (Embed, Seq_Len)
     pos_bias = ps.W[:, 1:seq_len]
 
-    # 2. 广播加法:
-    # (Embed, Seq, Batch) + (Embed, Seq) 
-    # Julia 会自动将 pos_bias 广播到每一个 Batch 上
     return SpatialTensor{1}(x.data .+ pos_bias)
 end
 
@@ -1296,33 +1478,174 @@ end
 ## File: src/module/convolution.jl
 ```julia
 
-struct Conv{D, F} <: AbstractModule
+struct Conv{D, F, P} <: AbstractModule
     in_ch::Int   # 需要记录这些以进行初始化
     out_ch::Int
     k_size::NTuple{D, Int}
     stride::NTuple{D, Int}
     dilation::NTuple{D, Int}
+    pad::P  # 新增: Padding 参数
     act::F
 end
 
-function Conv(D::Int, in_ch::Int, out_ch::Int, k_size::Union{Int, NTuple}; stride=1, dilation=1, act=identity)
+function Conv(D::Int, in_ch::Int, out_ch::Int, k_size::Union{Int, NTuple}; 
+              stride=1, dilation=1, pad=0, act=identity)
+
     ks = k_size isa Int ? ntuple(_->k_size, D) : k_size
     st = stride isa Int ? ntuple(_->stride, D) : stride
     di = dilation isa Int ? ntuple(_->dilation, D) : dilation
-    return Conv{D, typeof(act)}(in_ch, out_ch, ks, st, di, act)
+    pd = pad isa Int ? ntuple(_->pad, D) : pad
+    
+    return Conv{D, typeof(act), typeof(pd)}(in_ch, out_ch, ks, st, di, pd, act)
 end
-
 for N in 1:3    
     @eval begin
         function (l::Conv{$N})(x::SpatialTensor{$N}, ps::ParamsContainer)
-            y = NNlib.conv(x.data, ps.W; stride=l.stride, dilation=l.dilation, pad=0)
+            y = NNlib.conv(x.data, ps.W; stride=l.stride, dilation=l.dilation, pad=l.pad)
             bias_shape = (ntuple(_->1, $N)..., length(ps.b), 1)
             return SpatialTensor{$N}(l.act.(y .+ reshape(ps.b, bias_shape)))
         end
     end
 end
 
+function initialize(l::Conv{D}, rng::TaskLocalRNG = Random.default_rng()) where {D}
+    w_shape = (l.k_size..., l.in_ch, l.out_ch) 
+    fan_in = l.in_ch * prod(l.k_size)
+    scale = sqrt(2.0 / fan_in)
+    
+    return (
+        W = randn(rng, Float32, w_shape...) .* Float32(scale),
+        b = zeros(Float32, l.out_ch)
+    )
+end
 
+function Base.show(io::IO, l::Conv)
+    print(io, "Conv($(l.in_ch) => $(l.out_ch), k=$(l.k_size)")
+    all(x->x==1, l.stride) || print(io, ", s=$(l.stride)")
+    all(x->x==0, l.pad)    || print(io, ", p=$(l.pad)") # 打印 padding
+    all(x->x==1, l.dilation) || print(io, ", d=$(l.dilation)")
+    l.act != identity && print(io, ", $(l.act)")
+    print(io, ")")
+end
+
+
+```
+
+---
+
+## File: src/network/UNetAttentionBlock.jl
+```julia
+struct UNetAttentionBlock <: AbstractModule
+    norm::GroupNorm
+    attn::Attention # 只要这一个 struct
+end
+
+function UNetAttentionBlock(channels::Int)
+    return UNetAttentionBlock(
+        GroupNorm(32, channels),
+        Attention(channels, 4; causal=false) # 自动适配图像
+    )
+end
+
+function (m::UNetAttentionBlock)(x::SpatialTensor, ps)
+    # x 是 (W, H, C, B)
+    # m.norm 处理 (W, H, C, B)
+    h = m.norm(x, ps.norm)
+    
+    # m.attn 自动识别这是 SpatialTensor{2}，自动 flatten 处理
+    h = m.attn(h, ps.attn)
+    
+    # 残差连接
+    return x + h
+end
+```
+
+---
+
+## File: src/network/UNet.jl
+```julia
+struct RealUNet <: AbstractModule
+    time_embed::TimeEmbedding
+    
+    # 简单的两层架构示例 (32 -> 16 -> 8)
+    inc::Conv
+    
+    # Down 1 (32 -> 16)
+    down1_1::ResNetBlock
+    down1_2::ResNetBlock
+    down1_sample::Conv # stride=2
+    
+    # Down 2 (16 -> 8)
+    down2_1::ResNetBlock
+    down2_2::ResNetBlock
+    down2_attn::SpatialAttention # 在 8x8 处加 Attention
+    down2_sample::Conv # stride=2
+    
+    # Middle (8x8)
+    mid_1::ResNetBlock
+    mid_attn::SpatialAttention
+    mid_2::ResNetBlock
+    
+    # Up 2 (8 -> 16)
+    up2_0::Conv # Upsample
+    up2_1::ResNetBlock # Input: 拼接后的通道
+    up2_2::ResNetBlock
+    
+    # Up 1 (16 -> 32)
+    up1_0::Conv
+    up1_1::ResNetBlock
+    up1_2::ResNetBlock
+    
+    out::Sequential # Norm -> SiLU -> Conv
+end
+
+# Forward 逻辑需要手动管理 Skip Connections
+function (m::RealUNet)(x::SpatialTensor, t::Vector{Int}, ps)
+    # 1. Time Embed
+    t_emb = m.time_embed(t, ps.time_embed)
+    
+    # 2. Input
+    h = m.inc(x, ps.inc)
+    skips = [h] # 存储跳跃连接
+    
+    # 3. Down 1
+    h = m.down1_1(h, t_emb, ps.down1_1)
+    h = m.down1_2(h, t_emb, ps.down1_2)
+    push!(skips, h)
+    h = m.down1_sample(h, ps.down1_sample)
+    
+    # 4. Down 2
+    h = m.down2_1(h, t_emb, ps.down2_1)
+    h = m.down2_2(h, t_emb, ps.down2_2)
+    h = m.down2_attn(h, ps.down2_attn)
+    push!(skips, h)
+    h = m.down2_sample(h, ps.down2_sample)
+    
+    # 5. Middle
+    h = m.mid_1(h, t_emb, ps.mid_1)
+    h = m.mid_attn(h, ps.mid_attn)
+    h = m.mid_2(h, t_emb, ps.mid_2)
+    
+    # 6. Up 2 (concat skip)
+    h = upsample(h) # Nearest Neighbor
+    h = m.up2_0(h, ps.up2_0) # Conv after upsample
+    skip = pop!(skips)
+    h = cat_channels(h, skip) # 自定义 cat 函数
+    h = m.up2_1(h, t_emb, ps.up2_1)
+    h = m.up2_2(h, t_emb, ps.up2_2)
+    
+    # 7. Up 1
+    h = upsample(h)
+    h = m.up1_0(h, ps.up1_0)
+    skip = pop!(skips) # down1_2 output
+    # 注意: 还需要 pop inc output (具体取决于结构设计)
+    h = cat_channels(h, skip)
+    h = m.up1_1(h, t_emb, ps.up1_1)
+    h = m.up1_2(h, t_emb, ps.up1_2)
+    
+    # 8. Out
+    return m.out(h, ps.out)
+end
 ```
 
 ---

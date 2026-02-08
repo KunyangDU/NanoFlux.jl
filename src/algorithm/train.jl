@@ -22,7 +22,7 @@ function train!(model::AbstractModule, ps::ParamsContainer,
                 y = y_raw
             end
 
-            @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history)
+            @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history, config.config)
 
             if config.show_times > 0 && mod(mod(history.count - 1, total_loaders) + 1, config.show_times) == 0
                 print("Epoch $(epoch) [$(mod(history.count-1, total_loaders) + 1)/$(total_loaders)] - ")
@@ -74,15 +74,16 @@ function _train_step!(model::AbstractModule, x::AbstractNanoTensor, y::AbstractA
                         ps::ParamsContainer,
                         opt_state::ParamsContainer,
                         opt::AbstractOptimizer,
-                        history::TrainingHistory)
+                        history::TrainingHistory,
+                        config::AbstractAlgorithm)
 
-    @timeit TO "calc gradient" loss_val, grads = Zygote.withgradient(p -> loss(model, x, y, p), ps)
+    @timeit TO "calc gradient" loss_val, grads = Zygote.withgradient(p -> loss(model, x, y, p, config), ps)
 
     @timeit TO "update!" update!(ps, grads[1], opt_state, opt)
 
     if isdefined(history, :loss)
         push!(history.loss, loss_val)
-        push!(history.accuracy, accuracy(model, x, y, ps))
+        push!(history.accuracy, accuracy(model, x, y, ps, config))
     end
 
 end

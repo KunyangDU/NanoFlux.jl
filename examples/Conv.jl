@@ -1,7 +1,7 @@
 include("../src/NanoFlux.jl")
 
 # 显式特化针对 Conv 类型的 loss，覆盖 train.jl 中的默认逻辑
-function loss(model::Conv, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+function loss(model::Conv, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm)
     y_pred = model(x, ps) # ⚠️ 必须传入 ps
     diff = y_pred.data .- y
     L = sum(abs2, diff) / length(y)
@@ -9,7 +9,7 @@ function loss(model::Conv, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsCo
 end
 
 # Accuracy 对回归任务无意义，返回 0 以避免报错
-accuracy(model::Conv, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer) = 0.0
+accuracy(model::Conv, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm) = 0.0
 
 function test_single_conv()
     println("\n🧪 TEST 2: Training a Single Conv Layer (Regression)")
@@ -33,7 +33,7 @@ function test_single_conv()
     opt = Adam(learning_rate=1e-2) 
     config = TrainerConfig(epochs=20, show_times=5) # 增加 epochs 确保拟合
     
-    train!(model, loader, opt, config)
+    train!(model, initialize(model), loader, opt, config)
     
     println("\n", bg"✅ Single Conv Layer Test Passed!")
 end

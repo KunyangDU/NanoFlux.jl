@@ -20,3 +20,4 @@ function Base.show(io::IO, h::TrainingHistory)
     end
     print("\n")
 end
+

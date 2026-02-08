@@ -2,7 +2,7 @@ using MLDatasets, MLUtils, OneHotArrays
 using Zygote, NNlib
 using Random
 using Printf, TimerOutputs
-using Statistics: mean
+using Statistics: mean, var
 using JLD2
 using LinearAlgebra: triu, dot
 
@@ -15,6 +15,7 @@ include("wrapper/tensor.jl")
 include("control/algorithm.jl")
 include("control/information.jl")
 
+include("module/Identity.jl")
 include("module/sequential.jl")
 include("module/dense.jl")
 include("module/convolution.jl")
@@ -29,11 +30,18 @@ include("module/utils.jl")
 include("module/initialize.jl")
 include("module/summary.jl")
 include("module/show.jl")
+include("module/resnet.jl")
+include("module/time.jl")
+include("module/spatial.jl")
+
+include("network/UNetAttentionBlock.jl")
+include("network/UNet.jl")
 
 include("algorithm/train.jl")
 include("algorithm/update.jl")
 include("algorithm/loss.jl")
 include("algorithm/generate.jl")
+include("algorithm/diffusion.jl")
 
 include("optimizer/SGD.jl")
 include("optimizer/Adam.jl")

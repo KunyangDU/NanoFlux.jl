@@ -1,24 +1,21 @@
 
 
 """
-    Attention{H}(embed_dim::Int, seq_len::Int)
+    Attention(embed_dim, heads; dropout=0.0, causal=false)
 
-H: 头数 (Heads)，作为类型参数传入。
-实现标准的 Scaled Dot-Product Attention，并强制应用 Causal Mask (GPT 风格)。
-
-输入: (Embed, Seq, Batch)
-输出: (Embed, Seq, Batch)
+通用的多头注意力。
+输入形状: (Embed, Seq, Batch)
 """
 struct Attention{H} <: AbstractModule
     embed_dim::Int
     head_dim::Int
     scale::Float32
-    # 预计算的因果掩码 (1, Seq, Seq) - 使用 Bool 或 Float 都可以，这里用 Bool 方便逻辑
-    # 在 NanoGPT 中通常 Seq_Len 是固定的最大上下文长度
-    mask::Array{Bool, 3} 
+    # causal::Bool # 新增：控制是否应用因果遮罩
+    mask::Union{Nothing,Array{Bool,3}}
+    # mask 可以在 forward 时动态生成或缓存，这里为了简单先省略预计算 mask
 end
 
-function Attention{H}(embed_dim::Int, max_len::Int) where H
+function Attention{H}(embed_dim::Int, max_len::Int; causal::Bool=false) where H
     @assert embed_dim % H == 0 "Embedding dimension ($embed_dim) must be divisible by number of heads ($H)"
     head_dim = embed_dim ÷ H
     scale = Float32(1.0 / sqrt(head_dim))
@@ -31,20 +28,28 @@ function Attention{H}(embed_dim::Int, max_len::Int) where H
     # 我们希望 Query i 只能看见 Key j (其中 j <= i)。
     # 即 Row index j <= Col index i。这是上三角矩阵 (Upper Triangular)。
     
-
-    # 先创建一个 2D 矩阵 (Seq, Seq)
-    full_matrix = ones(Bool, max_len, max_len)
+    if causal
+        # 先创建一个 2D 矩阵 (Seq, Seq)
+        full_matrix = ones(Bool, max_len, max_len)
+        
+        # 取上三角 (Keep Row <= Col, 即 Key <= Query)
+        # triu 作用于 2D 矩阵
+        causal_mask_2d = triu(full_matrix)
+        
+        # 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
+        mask = reshape(causal_mask_2d, 1, max_len, max_len)
+    else
+        mask = nothing
+    end
     
-    # 取上三角 (Keep Row <= Col, 即 Key <= Query)
-    # triu 作用于 2D 矩阵
-    causal_mask_2d = triu(full_matrix)
-    
-    # 变形为 3D (1, Seq, Seq) 以便在前向传播中广播
-    mask = reshape(causal_mask_2d, 1, max_len, max_len)
-    
-    return Attention{H}(embed_dim, head_dim, scale, mask)
+    return return Attention{H}(
+        embed_dim, 
+        div(embed_dim, H), 
+        Float32(1.0 / sqrt(embed_dim / H)),
+        mask
+    )
 end
-Attention(embed_dim::Int, heads::Int, max_len::Int) = Attention{heads}(embed_dim, max_len)
+Attention(embed_dim::Int, heads::Int, max_len::Int; causal::Bool=false) = Attention{heads}(embed_dim, max_len; causal = causal)
 
 function initialize(l::Attention{H}, rng::TaskLocalRNG = Random.default_rng()) where H
     std = sqrt(2.0f0 / (5 * l.embed_dim)) # Xavier like
@@ -54,8 +59,7 @@ function initialize(l::Attention{H}, rng::TaskLocalRNG = Random.default_rng()) w
     )
 end
 
-
-function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
+function (l::Attention{H})(x::SpatialTensor{1}, ps::ParamsContainer) where H
     # x.data: (Embed, Seq, Batch)
     # T = Seq, B = Batch, D = Embed
     D, T, B = size(x.data)
@@ -67,90 +71,57 @@ function (l::Attention{H})(x::AbstractNanoTensor, ps::ParamsContainer) where H
     x_flat = reshape(x.data, D, :) # (D, T*B)
     qkv = ps.W_qkv * x_flat        # (3D, T*B)
     
-    # 分割与重塑 (Split & Reshape heads)
-    # qkv: (3 * H * HeadDim, T * B)
-    # 我们需要将其变为 (HeadDim, H, 3, T*B) 以便分割
-    # 但为了后续 batched_mul 方便，我们目标形状是: (HeadDim, T, H * B)
-    
-    # 这里的 reshape 稍微复杂，步骤如下：
-    # -> (HeadDim, H, 3, T, B) 
-    # -> Permute -> (3, HeadDim, T, H, B) 
-    # -> Split -> Q, K, V 都是 (HeadDim, T, H*B)
-    
     qkv_reshaped = reshape(qkv, l.head_dim, H, 3, T, B)
     
     # Permute 维度: 把 3 (QKV类别) 放到最前，把 H 和 B 放到最后准备合并
     qkv_permuted = permutedims(qkv_reshaped, (3, 1, 4, 2, 5)) # (3, HeadDim, T, H, B)
-    
-    # 此时 Q, K, V 视图分离
-    # 每一个都是 (HeadDim, T, H, B)
-    # 合并最后两个维度作为 "Batch" 给 batched_mul 使用 -> (HeadDim, T, H*B)
     batch_dim_size = H * B
     
     q = reshape(view(qkv_permuted, 1, :, :, :, :), l.head_dim, T, batch_dim_size)
     k = reshape(view(qkv_permuted, 2, :, :, :, :), l.head_dim, T, batch_dim_size)
     v = reshape(view(qkv_permuted, 3, :, :, :, :), l.head_dim, T, batch_dim_size)
     
-    # Attention Score 计算 (Scaled Dot-Product)
-    # Score = (K^T * Q) * scale
-    # K: (Dh, T, BatchAll) -> K^T 实际上是指空间维度的转置
-    # 我们利用 NNlib.batched_mul
-    # batched_mul(A, B) 对前两维做乘法，后维是 batch
-    # 我们需要 (T, T) 的结果。
-    # K 的列是 key vector k_j. Q 的列是 query vector q_i.
-    # Score[j, i] = k_j • q_i
-    # 这等价于 K' * Q (如果把 K 看作 Matrix, 每一列是一个 Key)
-    # Matrix Transpose: (T, Dh) * (Dh, T) -> (T, T)
-    
-    # batched_transpose 将 K 从 (Dh, T, Batch) -> (T, Dh, Batch)
     kt = permutedims(k, (2, 1, 3)) 
     
     attn_scores = NNlib.batched_mul(kt, q) .* l.scale # (T, T, H*B)
-    
-    # Causal Masking (因果遮蔽)
-    # attn_scores 形状 (Row=Key, Col=Query, Batch)
-    # Query i 应该关注 Key 1...i
-    # 即允许 Col i 访问 Row j (当 j <= i)
-    # j <= i 是矩阵的上三角部分 (Upper Triangular)
-    # 我们的 l.mask 已经是上三角为 1 (True)
-    
-    # 动态切片 mask 以匹配当前序列长度 T
-    current_mask = view(l.mask, 1, 1:T, 1:T) # (1, T, T)
-    
-    # 应用 Mask: False 的地方设为 -inf
-    # 广播: (T, T, H*B) + (1, T, T)
-    # 注意: Julia 的 ifelse 或直接加法。为了 Zygote 友好，通常用 + (1-mask)*(-1e9)
-    # 但这里用 fill value 比较直观
-    # 既然 mask 是 Bool (1=Keep, 0=Mask)，我们需要把 0 变成 -inf
-    large_neg = Float32(-1e9)
-    masked_scores = attn_scores .+ (map(!, current_mask) .* large_neg)
-    
-    # Softmax
-    # 对 dim=1 (Key 维度, 即每一列 Query 的分布) 做 softmax
-    attn_probs = softmax(masked_scores, dims=1)
-    
-    # 加权求和
-    # Out = V * Probs
-    # V: (Dh, T, Batch)
-    # Probs: (T, T, Batch)
-    # Out: (Dh, T, Batch) -> 每一列 Out[:, i] 是 V 的列的加权和
+
+    if !isnothing(l.mask)
+        current_mask = view(l.mask, 1, 1:T, 1:T) # (1, T, T)
+        large_neg = Float32(-1e9)
+        attn_scores .+= (map(!, current_mask) .* large_neg)
+    end
+
+    attn_probs = softmax(attn_scores, dims=1)
+
     y = NNlib.batched_mul(v, attn_probs)
-    
-    # 还原形状 (Merge Heads)
-    # y: (HeadDim, T, H*B) -> (HeadDim, T, H, B)
-    y_unflat = reshape(y, l.head_dim, T, H, B)
-    
-    # Permute 回去: (HeadDim, H, T, B) -> 展平前两维 -> (Embed, T, B)
-    y_permuted = permutedims(y_unflat, (1, 3, 2, 4)) # (HeadDim, H, T, B)
-    y_merged = reshape(y_permuted, D, T * B)
-    
-    # 输出投影
-    output = ps.W_proj * y_merged # (D, T*B)
-    
-    # 最终 Reshape 回 (D, T, B) 并包装
+    y = reshape(permutedims(reshape(y, l.head_dim, T, H, B), (1, 3, 2, 4)), D, T * B)
+
+    output = ps.W_proj * y # (D, T*B)
+
     final_out = reshape(output, D, T, B)
     return SpatialTensor{1}(final_out)
 end
+
+function (l::Attention{H})(x::SpatialTensor{2}, ps::ParamsContainer) where H
+    W, H′, C, B = size(x)
+    
+    # 检查维度匹配
+    @assert C == l.embed_dim "Input channels $C must match embed_dim $(l.embed_dim)"
+
+    # 1. (W, H, C, B) -> (C, W*H, B)
+    x_perm = permutedims(x.data, (3, 1, 2, 4))
+    x_flat = reshape(x_perm, C, W*H, B)
+    
+    # 2. 调用核心逻辑
+    out_flat = _core_attention_forward(l, SpatialTensor{1}(x_flat), ps).data
+    
+    # 3. 还原
+    out_reshaped = reshape(out_flat, C, W, H, B)
+    out_final = permutedims(out_reshaped, (2, 3, 1, 4))
+    
+    return SpatialTensor{2}(out_final)
+end
+
 
 function Base.show(io::IO, l::Attention{H}) where H
     print(io, "Attention(heads=$H, embed=$(l.embed_dim))")

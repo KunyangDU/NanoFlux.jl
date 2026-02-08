@@ -1,4 +1,4 @@
-function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm)
     y_pred = model(x, ps)
     logits = y_pred.data
     logits_safe = logits .- maximum(logits, dims=1)
@@ -6,7 +6,7 @@ function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps
     return -sum(y .* log.(probs .+ 1.0f-10)) / size(logits, 2)
 end
 
-function loss(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer)
+function loss(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer, ::NoAlgorithm)
     # 1. 前向传播 -> (Vocab, Seq, Batch)
     logits = model(x, ps).data 
     
@@ -48,7 +48,7 @@ end
 #     true_idx = [c[1] for c in argmax(y, dims=1)]
 #     return mean(pred_idx .== true_idx)
 # end
-function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm)
     y_pred = model(x, ps)
     logits = y_pred.data
     
@@ -65,7 +65,7 @@ function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray
     # 3. mean 支持 GPU 数组，直接返回结果
     return mean(matches)
 end
-function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer)
+function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer, ::NoAlgorithm)
     # 1. 前向传播
     logits = model(x, ps).data # (Vocab, Seq, Batch)
 
@@ -81,4 +81,48 @@ function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, 
     y_reshaped = reshape(y, 1, size(y)...)
     
     return mean(getindex.(pred_indices, 1) .== y_reshaped)
+end
+
+# 定义一个全局或传入的 DiffusionProcess 实例
+# 为了方便，这里假设你会在 main 脚本里定义它，或者将其设为全局常量
+# const DIFFUSION = DiffusionProcess(1000) 
+
+# 重载 loss 函数
+function loss(model::UNet, x::SpatialTensor, ::AbstractArray, ps::ParamsContainer, DIFFUSION::DiffusionProcess)
+    # x: (W, H, C, B) - 真实图片
+    # y: 在 DDPM 训练中通常被忽略（或者是条件标签，这里暂时忽略）
+    
+    batch_size = size(x, 4)
+    device = x.data isa Array ? CPU() : GPU() # 简单的设备判断
+    
+    # 1. 随机采样时间步 t
+    # t ~ Uniform(1, 1000)
+    t = rand(1:DIFFUSION.timesteps, batch_size) 
+    
+    # 2. 生成随机噪声 epsilon
+    noise = randn(Float32, size(x))
+    if device isa GPU
+        noise = move_to(GPU(), noise)
+        # t 保持在 CPU 用于索引，或者索引后再移到 GPU，取决于 q_sample 实现
+        # 通常建议: t 留在 CPU 做索引，取出的系数移到 GPU
+    end
+    
+    # 3. 加噪 (Forward Process)
+    # 注意：你需要确保 DIFFUSION 全局变量存在，或者将其传进来
+    # 这里为了演示，假设有一个全局 DIFFUSION 对象
+    x_t_data = q_sample(DIFFUSION, x.data, t, noise)
+    x_t = SpatialTensor{2}(x_t_data)
+    
+    # 4. 模型预测噪声
+    # 你的 UNet forward 签名是 (x, t, ps)
+    pred_noise = model(x_t, t, ps)
+    
+    # 5. 计算 MSE Loss
+    diff = noise .- pred_noise.data
+    return mean(abs2, diff)
+end
+
+# 重载 accuracy (DDPM 不需要 accuracy，返回 0 或者 MSE)
+function accuracy(model::UNet, x::SpatialTensor, y::AbstractArray, ps::ParamsContainer, DIFFUSION::DiffusionProcess)
+    return 0.0f0 
 end

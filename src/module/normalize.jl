@@ -38,3 +38,42 @@ end
 function Base.show(io::IO, l::LayerNorm)
     print(io, "LayerNorm($(l.features))")
 end
+
+
+# 放在 src/utils.jl
+
+# 放在 src/module/normalize.jl
+# GroupNorm 实现 (简化版，将 channel 分组归一化)
+struct GroupNorm <: AbstractModule
+    num_groups::Int
+    num_channels::Int
+    eps::Float32
+end
+GroupNorm(g::Int, c::Int) = GroupNorm(g, c, 1.0f-5)
+
+function initialize(l::GroupNorm, ::TaskLocalRNG)
+    return (weight = ones(Float32, l.num_channels), bias = zeros(Float32, l.num_channels))
+end
+
+function (gn::GroupNorm)(x::SpatialTensor{D}, ps) where D
+    # x: (W, H, C, B)
+    W, H, C, B = size(x)
+    G = gn.num_groups
+    @assert C % G == 0 "Channel must be divisible by groups"
+    
+    # Reshape: (W, H, C/G, G, B) -> 归一化维度: (W, H, C/G)
+    x_reshaped = reshape(x.data, W, H, div(C, G), G, B)
+    
+    # 计算均值和方差 (dims=1,2,3)
+    μ = mean(x_reshaped, dims=(1,2,3))
+    σ² = var(x_reshaped, dims=(1,2,3), mean=μ, corrected=false)
+    
+    # 归一化
+    x_norm = (x_reshaped .- μ) ./ sqrt.(σ² .+ gn.eps)
+    
+    # 还原形状并应用仿射变换 (Weight & Bias 需要 reshape 以广播)
+    x_out = reshape(x_norm, W, H, C, B)
+    w_shape = (ntuple(_->1, D)..., C, 1)
+    
+    return SpatialTensor{D}(x_out .* reshape(ps.weight, w_shape) .+ reshape(ps.bias, w_shape))
+end
