@@ -5,6 +5,7 @@ using Printf, TimerOutputs
 using Statistics: mean, var
 using JLD2
 using LinearAlgebra: triu, dot
+using ImageIO,ImageCore
 
 include("abstract.jl")
 
@@ -52,6 +53,7 @@ include("fileIO/utils.jl")
 include("fileIO/tokenizer.jl")
 include("fileIO/lm.jl")
 include("fileIO/spatial.jl")
+include("fileIO/flickr8k.jl")
 
 include("gpu/move.jl")
 

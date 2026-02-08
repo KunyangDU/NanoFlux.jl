@@ -10,9 +10,9 @@ function load_cifar10(; batch_size::Int=32, split::Symbol=:train, normalize::Boo
 end
 
 
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 LEARNING_RATE = 1e-4
-EPOCHS = 20
+EPOCHS = 5
 CUT_STEP = Inf
 BASE_CH = 32  
 TIME_DIM = BASE_CH * 4 
@@ -67,11 +67,11 @@ model = UNet(
         Conv(2, BASE_CH, 3, 3, stride=1, pad=1) # Output: 3 (RGB)
     )
 )
-@save "examples/data/ddpm_model_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2.jld2" model
+@save "examples/data/ddpm_model_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2" model
 
-ps = initialize(model)
-# @load "examples/data/ddpm_ps_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2.jld2" ps
-
+# ps = initialize(model)
+@load "examples/data/ddpm_ps_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2" ps
+LEARNING_RATE = 1e-5
 opt = Adam(
     learning_rate = LEARNING_RATE
 )
@@ -87,5 +87,5 @@ train_loader = load_cifar10(batch_size=BATCH_SIZE, split=:train)
 
 ps,history = train!(model, ps, train_loader, opt, config)
 
-@save "examples/data/ddpm_ps_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2.jld2" ps
-@save "examples/data/ddpm_history_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2.jld2" history
+@save "examples/data/ddpm_ps_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2" ps
+@save "examples/data/ddpm_history_CIFAR10_T$(TIME_STEP)_CH$(BASE_CH)_B$(BATCH_SIZE)_LR$(LEARNING_RATE)_EP$(EPOCHS)_Cut$(CUT_STEP).jld2" history

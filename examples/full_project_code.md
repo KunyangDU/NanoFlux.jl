@@ -60,7 +60,7 @@ using MLDatasets, MLUtils, OneHotArrays
 using Zygote, NNlib
 using Random
 using Printf, TimerOutputs
-using Statistics: mean
+using Statistics: mean, var
 using JLD2
 using LinearAlgebra: triu, dot
 
@@ -99,6 +99,7 @@ include("algorithm/train.jl")
 include("algorithm/update.jl")
 include("algorithm/loss.jl")
 include("algorithm/generate.jl")
+include("algorithm/diffusion.jl")
 
 include("optimizer/SGD.jl")
 include("optimizer/Adam.jl")
@@ -636,21 +637,43 @@ end
 ## File: src/module/identity.jl
 ```julia
 """
-    Identity()
+    Identity(act=identity)
 
-恒等映射模块。直接返回输入，不进行任何操作。
-用于残差连接中的 shortcut 分支（当输入输出维度一致时）。
+恒等映射模块，支持可选的激活函数。
+- `Identity()`: 不做任何操作（直通），常用于 ResNet 的 Shortcut。
+- `Identity(relu)`: 仅作为激活层使用。
 """
-struct Identity <: AbstractModule end
+struct Identity{F} <: AbstractModule
+    act::F
+end
 
-# 前向传播：直接返回 x
-(::Identity)(x::AbstractNanoTensor, ::ParamsContainer) = x
+# 默认构造函数：act 默认为 identity 函数
+Identity() = Identity(identity)
 
-# 初始化：没有任何参数
-initialize(::Identity, ::Any) = NamedTuple()
+# 当 act 为 identity 时，直接返回输入，避免广播开销
+(::Identity{typeof(identity)})(x::AbstractNanoTensor, ::ParamsContainer) = x
 
-# 打印显示
-Base.show(io::IO, ::Identity) = print(io, "Identity()")
+# 当 act 不为 identity 时 (例如 silu)，执行广播操作
+function (m::Identity)(x::SpatialTensor{D}, ::ParamsContainer) where D
+    # 保持 SpatialTensor 类型
+    return SpatialTensor{D}(m.act.(x.data))
+end
+
+function (m::Identity)(x::FlatTensor, ::ParamsContainer)
+    # 保持 FlatTensor 类型
+    return FlatTensor(m.act.(x.data))
+end
+
+# 无论是否有激活函数，Identity 都没有可训练参数
+initialize(::Identity, ::TaskLocalRNG) = NamedTuple()
+
+function Base.show(io::IO, m::Identity)
+    if m.act === identity
+        print(io, "Identity()")
+    else
+        print(io, "Identity($(m.act))")
+    end
+end
 ```
 
 ---
@@ -684,11 +707,11 @@ end
 
 # 初始化逻辑略 (对每个子模块调用 initialize)
 
-function (m::ResNetBlock)(x::SpatialTensor, t_emb::AbstractArray, ps)
-    # 1. 第一层卷积
+function (m::ResNetBlock)(x::SpatialTensor, t_emb::AbstractArray, ps::ParamsContainer)
+    # 第一层卷积
     h = m.conv1(m.norm1(x, ps.norm1), ps.conv1)
     
-    # 2. 注入时间嵌入 (Scale & Shift 或 仅 Add)
+    # 注入时间嵌入 (Scale & Shift 或 仅 Add)
     # DDPM 论文通常直接相加: h + dense(t_emb)
     # t_emb: (TimeDim, Batch) -> proj -> (OutCh, Batch)
     t_proj = m.time_proj(FlatTensor(t_emb), ps.time_proj).data
@@ -698,13 +721,24 @@ function (m::ResNetBlock)(x::SpatialTensor, t_emb::AbstractArray, ps)
     t_proj_reshaped = reshape(t_proj, 1, 1, size(t_proj)...)
     h = SpatialTensor{2}(h.data .+ t_proj_reshaped)
     
-    # 3. 第二层卷积
+    # 第二层卷积
     h = m.conv2(m.norm2(h, ps.norm2), ps.conv2)
     
-    # 4. 残差连接
+    # 残差连接
     sc = (m.shortcut isa Identity) ? x : m.shortcut(x, ps.shortcut)
     
     return h + sc
+end
+function initialize(m::ResNetBlock, rng::TaskLocalRNG = Random.default_rng())
+    return (
+        # 必须显式初始化每一个子模块，并给它们起对应的名字
+        norm1     = initialize(m.norm1, rng),
+        conv1     = initialize(m.conv1, rng),
+        norm2     = initialize(m.norm2, rng),
+        conv2     = initialize(m.conv2, rng),
+        time_proj = initialize(m.time_proj, rng),
+        shortcut  = initialize(m.shortcut, rng)
+    )
 end
 ```
 
@@ -723,6 +757,20 @@ function format_number(n::Int)
 end
 
 silu(x) = x .* sigmoid.(x) # DDPM 标配激活函数
+
+# 最近邻上采样 (2x)
+function upsample(x::SpatialTensor{D}) where D
+    # 假设 x.data 是 (W, H, C, B)
+    # NNlib.upsample_nearest 默认行为适配 WHCB
+    new_data = NNlib.upsample_nearest(x.data, (2, 2))
+    return SpatialTensor{D}(new_data)
+end
+
+# 通道拼接
+function cat_channels(x1::SpatialTensor{D}, x2::SpatialTensor{D}) where D
+    # 沿着第 3 维 (Channel) 拼接
+    return SpatialTensor{D}(cat(x1.data, x2.data, dims=3))
+end
 
 ```
 
@@ -943,9 +991,9 @@ struct GroupNorm <: AbstractModule
     num_channels::Int
     eps::Float32
 end
-GroupNorm(g::Int, c::Int) = GroupNorm(g, c, 1e-5f0)
+GroupNorm(g::Int, c::Int) = GroupNorm(g, c, 1.0f-5)
 
-function initialize(l::GroupNorm, rng)
+function initialize(l::GroupNorm, ::TaskLocalRNG)
     return (weight = ones(Float32, l.num_channels), bias = zeros(Float32, l.num_channels))
 end
 
@@ -1070,10 +1118,10 @@ function (m::SpatialAttention)(x::SpatialTensor{D}, ps::ParamsContainer) where D
     # x: (W, H, C, B) -> D=2
     W, H, C, B = size(x)
     
-    # 1. GroupNorm (DDPM 标配: Pre-Norm)
+    # GroupNorm (DDPM 标配: Pre-Norm)
     h = m.norm(x, ps.norm)
     
-    # 2. 维度变换: (W, H, C, B) -> (C, W*H, B)
+    # 维度变换: (W, H, C, B) -> (C, W*H, B)
     # Julia 是列优先 (Column-Major) 存储：
     # 直接 reshape(x, :, B) 会合并 W, H, C，导致通道混杂。
     # 我们需要先 permutedims 把 C 放到第一维。
@@ -1081,7 +1129,7 @@ function (m::SpatialAttention)(x::SpatialTensor{D}, ps::ParamsContainer) where D
     h_perm = permutedims(h.data, (3, 1, 2, 4)) 
     h_flat_data = reshape(h_perm, C, W * H, B)
     
-    # 3. 包装成 SpatialTensor{1} 并调用 Attention
+    # 包装成 SpatialTensor{1} 并调用 Attention
     # 这里的 h_seq 维度符合 Attention 的要求: (Embed, Seq, Batch)
     h_seq = SpatialTensor{1}(h_flat_data)
     
@@ -1089,13 +1137,13 @@ function (m::SpatialAttention)(x::SpatialTensor{D}, ps::ParamsContainer) where D
     attn_out_tensor = m.attn(h_seq, ps.attn)
     attn_out_data = attn_out_tensor.data # (C, W*H, B)
     
-    # 4. 维度还原: (C, W*H, B) -> (W, H, C, B)
+    # 维度还原: (C, W*H, B) -> (W, H, C, B)
     # 先 reshape 回 (C, W, H, B)
     out_reshaped = reshape(attn_out_data, C, W, H, B)
     # 再 permute 回 (W, H, C, B)
     out_perm = permutedims(out_reshaped, (2, 3, 1, 4))
     
-    # 5. 残差连接 (x + Attention(Norm(x)))
+    # 残差连接 (x + Attention(Norm(x)))
     # 注意: 这里的加法是 Element-wise 的，要求维度完全一致
     return x + SpatialTensor{D}(out_perm)
 end
@@ -1322,10 +1370,10 @@ function TimeEmbedding(dim::Int)
     ))
 end
 
-initialize(m::TimeEmbedding, rng) = initialize(m.mlp, rng)
+initialize(m::TimeEmbedding, rng::TaskLocalRNG) = initialize(m.mlp, rng)
 
 function (m::TimeEmbedding)(t::Vector{Int}, ps::ParamsContainer)
-    # 1. 正弦编码
+    # 正弦编码
     half_dim = m.dim ÷ 2
     emb_scale = log(10000f0) / (half_dim - 1)
     emb = exp.(-Float32.(0:half_dim-1) * emb_scale) # (Half,)
@@ -1334,7 +1382,7 @@ function (m::TimeEmbedding)(t::Vector{Int}, ps::ParamsContainer)
     emb = reshape(emb, :, 1) .* reshape(Float32.(t)', 1, :) 
     emb = vcat(sin.(emb), cos.(emb)) # (Dim, Batch)
     
-    # 2. MLP 投影
+    # MLP 投影
     # 需要把 FlatTensor 包装传给 Dense，或者直接调用
     # 这里假设你的 Dense 接受 Matrix
     # NanoFlux 的 Dense 接受 FlatTensor
@@ -1547,7 +1595,7 @@ function UNetAttentionBlock(channels::Int)
     )
 end
 
-function (m::UNetAttentionBlock)(x::SpatialTensor, ps)
+function (m::UNetAttentionBlock)(x::SpatialTensor, ps::ParamsContainer)
     # x 是 (W, H, C, B)
     # m.norm 处理 (W, H, C, B)
     h = m.norm(x, ps.norm)
@@ -1564,7 +1612,7 @@ end
 
 ## File: src/network/UNet.jl
 ```julia
-struct RealUNet <: AbstractModule
+struct UNet <: AbstractModule
     time_embed::TimeEmbedding
     
     # 简单的两层架构示例 (32 -> 16 -> 8)
@@ -1600,51 +1648,93 @@ struct RealUNet <: AbstractModule
 end
 
 # Forward 逻辑需要手动管理 Skip Connections
-function (m::RealUNet)(x::SpatialTensor, t::Vector{Int}, ps)
+function (m::UNet)(x::SpatialTensor, t::Vector{Int}, ps::ParamsContainer)
     # 1. Time Embed
     t_emb = m.time_embed(t, ps.time_embed)
     
     # 2. Input
-    h = m.inc(x, ps.inc)
-    skips = [h] # 存储跳跃连接
+    h_inc = m.inc(x, ps.inc)
     
-    # 3. Down 1
-    h = m.down1_1(h, t_emb, ps.down1_1)
-    h = m.down1_2(h, t_emb, ps.down1_2)
-    push!(skips, h)
-    h = m.down1_sample(h, ps.down1_sample)
+    # 3. Down 1 (32x32)
+    h_d1 = m.down1_1(h_inc, t_emb, ps.down1_1)
+    h_d1 = m.down1_2(h_d1, t_emb, ps.down1_2)
+    # [关键] 保存 h_d1 用于后面的 skip connection，而不是 push!
     
-    # 4. Down 2
-    h = m.down2_1(h, t_emb, ps.down2_1)
-    h = m.down2_2(h, t_emb, ps.down2_2)
-    h = m.down2_attn(h, ps.down2_attn)
-    push!(skips, h)
-    h = m.down2_sample(h, ps.down2_sample)
+    h_d1_sample = m.down1_sample(h_d1, ps.down1_sample) # 下采样 -> 16x16
     
-    # 5. Middle
-    h = m.mid_1(h, t_emb, ps.mid_1)
-    h = m.mid_attn(h, ps.mid_attn)
-    h = m.mid_2(h, t_emb, ps.mid_2)
+    # 4. Down 2 (16x16)
+    h_d2 = m.down2_1(h_d1_sample, t_emb, ps.down2_1)
+    h_d2 = m.down2_2(h_d2, t_emb, ps.down2_2)
+    h_d2 = m.down2_attn(h_d2, ps.down2_attn)
+    # [关键] 保存 h_d2 用于后面的 skip connection
     
-    # 6. Up 2 (concat skip)
-    h = upsample(h) # Nearest Neighbor
-    h = m.up2_0(h, ps.up2_0) # Conv after upsample
-    skip = pop!(skips)
-    h = cat_channels(h, skip) # 自定义 cat 函数
-    h = m.up2_1(h, t_emb, ps.up2_1)
-    h = m.up2_2(h, t_emb, ps.up2_2)
+    h_d2_sample = m.down2_sample(h_d2, ps.down2_sample) # 下采样 -> 8x8
     
-    # 7. Up 1
-    h = upsample(h)
-    h = m.up1_0(h, ps.up1_0)
-    skip = pop!(skips) # down1_2 output
-    # 注意: 还需要 pop inc output (具体取决于结构设计)
-    h = cat_channels(h, skip)
-    h = m.up1_1(h, t_emb, ps.up1_1)
-    h = m.up1_2(h, t_emb, ps.up1_2)
+    # 5. Middle (8x8)
+    h_mid = m.mid_1(h_d2_sample, t_emb, ps.mid_1)
+    h_mid = m.mid_attn(h_mid, ps.mid_attn)
+    h_mid = m.mid_2(h_mid, t_emb, ps.mid_2)
+    
+    # 6. Up 2 (8 -> 16)
+    h_up2 = upsample(h_mid)
+    h_up2 = m.up2_0(h_up2, ps.up2_0)
+    
+    # [关键] 直接使用 h_d2 进行拼接，而不是 pop!
+    h_up2 = cat_channels(h_up2, h_d2)
+    
+    h_up2 = m.up2_1(h_up2, t_emb, ps.up2_1)
+    h_up2 = m.up2_2(h_up2, t_emb, ps.up2_2)
+    
+    # 7. Up 1 (16 -> 32)
+    h_up1 = upsample(h_up2)
+    h_up1 = m.up1_0(h_up1, ps.up1_0)
+    
+    # [关键] 直接使用 h_d1 进行拼接
+    h_up1 = cat_channels(h_up1, h_d1)
+    
+    h_up1 = m.up1_1(h_up1, t_emb, ps.up1_1)
+    h_up1 = m.up1_2(h_up1, t_emb, ps.up1_2)
     
     # 8. Out
-    return m.out(h, ps.out)
+    return m.out(h_up1, ps.out)
+end
+
+# 放在 src/network/UNet.jl 中
+
+function initialize(m::UNet, rng::TaskLocalRNG = Random.default_rng())
+    return (
+        time_embed   = initialize(m.time_embed, rng),
+        inc          = initialize(m.inc, rng),
+        
+        # Down 1
+        down1_1      = initialize(m.down1_1, rng),
+        down1_2      = initialize(m.down1_2, rng),
+        down1_sample = initialize(m.down1_sample, rng),
+        
+        # Down 2
+        down2_1      = initialize(m.down2_1, rng),
+        down2_2      = initialize(m.down2_2, rng),
+        down2_attn   = initialize(m.down2_attn, rng),
+        down2_sample = initialize(m.down2_sample, rng),
+        
+        # Middle
+        mid_1        = initialize(m.mid_1, rng),
+        mid_attn     = initialize(m.mid_attn, rng),
+        mid_2        = initialize(m.mid_2, rng),
+        
+        # Up 2
+        up2_0        = initialize(m.up2_0, rng),
+        up2_1        = initialize(m.up2_1, rng),
+        up2_2        = initialize(m.up2_2, rng),
+        
+        # Up 1
+        up1_0        = initialize(m.up1_0, rng),
+        up1_1        = initialize(m.up1_1, rng),
+        up1_2        = initialize(m.up1_2, rng),
+        
+        # Out
+        out          = initialize(m.out, rng)
+    )
 end
 ```
 
@@ -1652,7 +1742,7 @@ end
 
 ## File: src/algorithm/loss.jl
 ```julia
-function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm)
     y_pred = model(x, ps)
     logits = y_pred.data
     logits_safe = logits .- maximum(logits, dims=1)
@@ -1660,7 +1750,7 @@ function loss(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps
     return -sum(y .* log.(probs .+ 1.0f-10)) / size(logits, 2)
 end
 
-function loss(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer)
+function loss(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer, ::NoAlgorithm)
     # 1. 前向传播 -> (Vocab, Seq, Batch)
     logits = model(x, ps).data 
     
@@ -1702,7 +1792,7 @@ end
 #     true_idx = [c[1] for c in argmax(y, dims=1)]
 #     return mean(pred_idx .== true_idx)
 # end
-function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer)
+function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray, ps::ParamsContainer, ::NoAlgorithm)
     y_pred = model(x, ps)
     logits = y_pred.data
     
@@ -1719,7 +1809,7 @@ function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::AbstractArray
     # 3. mean 支持 GPU 数组，直接返回结果
     return mean(matches)
 end
-function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer)
+function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, ps::ParamsContainer, ::NoAlgorithm)
     # 1. 前向传播
     logits = model(x, ps).data # (Vocab, Seq, Batch)
 
@@ -1735,6 +1825,50 @@ function accuracy(model::AbstractModule, x::AbstractNanoTensor, y::Matrix{Int}, 
     y_reshaped = reshape(y, 1, size(y)...)
     
     return mean(getindex.(pred_indices, 1) .== y_reshaped)
+end
+
+# 定义一个全局或传入的 DiffusionProcess 实例
+# 为了方便，这里假设你会在 main 脚本里定义它，或者将其设为全局常量
+# const DIFFUSION = DiffusionProcess(1000) 
+
+# 重载 loss 函数
+function loss(model::UNet, x::SpatialTensor, ::AbstractArray, ps::ParamsContainer, DIFFUSION::DiffusionProcess)
+    # x: (W, H, C, B) - 真实图片
+    # y: 在 DDPM 训练中通常被忽略（或者是条件标签，这里暂时忽略）
+    
+    batch_size = size(x, 4)
+    device = x.data isa Array ? CPU() : GPU() # 简单的设备判断
+    
+    # 1. 随机采样时间步 t
+    # t ~ Uniform(1, 1000)
+    t = rand(1:DIFFUSION.timesteps, batch_size) 
+    
+    # 2. 生成随机噪声 epsilon
+    noise = randn(Float32, size(x))
+    if device isa GPU
+        noise = move_to(GPU(), noise)
+        # t 保持在 CPU 用于索引，或者索引后再移到 GPU，取决于 q_sample 实现
+        # 通常建议: t 留在 CPU 做索引，取出的系数移到 GPU
+    end
+    
+    # 3. 加噪 (Forward Process)
+    # 注意：你需要确保 DIFFUSION 全局变量存在，或者将其传进来
+    # 这里为了演示，假设有一个全局 DIFFUSION 对象
+    x_t_data = q_sample(DIFFUSION, x.data, t, noise)
+    x_t = SpatialTensor{2}(x_t_data)
+    
+    # 4. 模型预测噪声
+    # 你的 UNet forward 签名是 (x, t, ps)
+    pred_noise = model(x_t, t, ps)
+    
+    # 5. 计算 MSE Loss
+    diff = noise .- pred_noise.data
+    return mean(abs2, diff)
+end
+
+# 重载 accuracy (DDPM 不需要 accuracy，返回 0 或者 MSE)
+function accuracy(model::UNet, x::SpatialTensor, y::AbstractArray, ps::ParamsContainer, DIFFUSION::DiffusionProcess)
+    return 0.0f0 
 end
 ```
 
@@ -1766,7 +1900,7 @@ function train!(model::AbstractModule, ps::ParamsContainer,
                 y = y_raw
             end
 
-            @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history)
+            @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history, config.config)
 
             if config.show_times > 0 && mod(mod(history.count - 1, total_loaders) + 1, config.show_times) == 0
                 print("Epoch $(epoch) [$(mod(history.count-1, total_loaders) + 1)/$(total_loaders)] - ")
@@ -1818,21 +1952,101 @@ function _train_step!(model::AbstractModule, x::AbstractNanoTensor, y::AbstractA
                         ps::ParamsContainer,
                         opt_state::ParamsContainer,
                         opt::AbstractOptimizer,
-                        history::TrainingHistory)
+                        history::TrainingHistory,
+                        config::AbstractAlgorithm)
 
-    @timeit TO "calc gradient" loss_val, grads = Zygote.withgradient(p -> loss(model, x, y, p), ps)
+    @timeit TO "calc gradient" loss_val, grads = Zygote.withgradient(p -> loss(model, x, y, p, config), ps)
 
     @timeit TO "update!" update!(ps, grads[1], opt_state, opt)
 
     if isdefined(history, :loss)
         push!(history.loss, loss_val)
-        push!(history.accuracy, accuracy(model, x, y, ps))
+        push!(history.accuracy, accuracy(model, x, y, ps, config))
     end
 
 end
 
 
 
+```
+
+---
+
+## File: src/algorithm/diffusion.jl
+```julia
+# 前向加噪核心公式: q(x_t | x_0)
+# x_0: (W, H, C, B)
+# t: (B,)
+# noise: (W, H, C, B)
+q_sample(d::DiffusionProcess, x_0::AbstractArray, t::Vector{Int}, noise::AbstractArray) = reshape(d.sqrt_alpha_bar[t], 1, 1, 1, :) .* x_0 .+ reshape(d.sqrt_one_minus_alpha_bar[t], 1, 1, 1, :) .* noise
+
+"""
+    p_sample(model, ps, d, x, t_batch, t_scalar)
+
+反向过程的单步计算: x_{t-1} ~ p_theta(x_{t-1}|x_t)
+公式: x_{t-1} = 1/sqrt(alpha) * (x_t - (1-alpha)/sqrt(1-alpha_bar) * eps) + sigma * z
+"""
+function p_sample(model, ps, d, x::AbstractArray, t_batch::Vector{Int}, t::Int)
+    β_t = d.beta[t]
+    α_t = d.alpha[t]
+    sqrt_recip_α_t = 1.0f0 / sqrt(α_t)
+    
+    # sqrt(1 - alpha_bar_t)
+    sqrt_one_minus_α_bar_t = d.sqrt_one_minus_alpha_bar[t]
+    
+    # 系数: (1 - α_t) / sqrt(1 - α_bar_t)
+    coeff_eps = (1.0f0 - α_t) / sqrt_one_minus_α_bar_t
+    
+    # 方差 σ_t (论文中通常取 sqrt(β_t))
+    σ_t = sqrt(β_t)
+    
+    # 包装成 SpatialTensor
+    x_tensor = SpatialTensor{2}(x) 
+    pred_noise = model(x_tensor, t_batch, ps).data
+    
+    # mean = 1/sqrt(α) * (x - coeff * eps)
+    mean = sqrt_recip_α_t .* (x .- coeff_eps .* pred_noise)
+    
+    return t > 1 ? (mean .+ σ_t .* randn(Float32, size(x))) : mean
+end
+
+"""
+    sample_ddpm(model, ps, diffusion, shape; save_path=nothing)
+
+DDPM 采样主函数 (Algorithm 2)。
+- shape: (W, H, C, BatchSize), 例如 (32, 32, 3, 16)
+"""
+function sample(model::AbstractModule, ps::ParamsContainer, d::DiffusionProcess, shape::Tuple)
+    
+    # 初始化纯噪声 x_T ~ N(0, I)
+    device = ps.inc.W isa Array ? CPU() : GPU() # 检测模型在哪个设备
+    img = randn(Float32, shape) |> x -> move_to(device, x)
+    
+    println("Start Sampling from T=$(d.timesteps)...")
+    
+    # 反向去噪循环 (从 T 到 1)
+    for t in d.timesteps:-1:1
+        # 构造时间步 batch: [t, t, ..., t]
+        t_batch = fill(t, shape[end])
+
+        # 执行单步去噪
+        img = p_sample(model, ps, d, img, t_batch, t)
+        
+        # (可选) 打印进度
+        if t % 5 == 0
+            print("$t ")
+        end
+    end
+    println("\nDone!")
+
+    # 最终处理：映射回 [0, 1] 并转为图片对象
+    # DDPM 的输出通常在 [-1, 1] 之间，需要 clamp 一下防止溢出
+    img_clamped = clamp.(img, -1.0f0, 1.0f0)
+    img_norm = (img_clamped .+ 1.0f0) ./ 2.0f0
+    final_data = img_norm |> x -> move_to(CPU(), x)
+    
+    return [colorview(RGB, permutedims(final_data[:,:,:,i], (3, 2,1))) for i in 1:size(final_data)[end]]
+end
 ```
 
 ---
@@ -1915,7 +2129,7 @@ end
 
 ## File: src/control/algorithm.jl
 ```julia
-
+struct NoAlgorithm <: AbstractAlgorithm end
 """
     SimpleAlgorithm(args...)
 
@@ -1930,6 +2144,34 @@ end
     target_acc::Union{Float32, Nothing}  = nothing
     patience::Int64                      = 1
     cut_step::Number                     = Inf
+    config::AbstractAlgorithm            = NoAlgorithm()
+end
+
+
+
+struct DiffusionProcess <: AbstractAlgorithm
+    timesteps::Int
+    beta::Vector{Float32}
+    alpha::Vector{Float32}
+    alpha_bar::Vector{Float32}
+    sqrt_alpha_bar::Vector{Float32}
+    sqrt_one_minus_alpha_bar::Vector{Float32}
+end
+
+function DiffusionProcess(timesteps::Int=1000; beta_start::Float64=1e-4, beta_end::Float64=0.02)
+    # 线性调度
+    beta = range(beta_start, beta_end, length=timesteps) |> collect .|> Float32
+    alpha = 1.0f0 .- beta
+    alpha_bar = cumprod(alpha)
+    
+    return DiffusionProcess(
+        timesteps,
+        beta,
+        alpha,
+        alpha_bar,
+        sqrt.(alpha_bar),
+        sqrt.(1.0f0 .- alpha_bar)
+    )
 end
 ```
 
@@ -1959,6 +2201,7 @@ function Base.show(io::IO, h::TrainingHistory)
     end
     print("\n")
 end
+
 
 ```
 

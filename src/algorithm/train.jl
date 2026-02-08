@@ -8,7 +8,7 @@ function train!(model::AbstractModule, ps::ParamsContainer,
     manualGC()
 
     total_loaders = length(train_loader)
-
+    last_show_time = time()
     for epoch in 1:config.epochs
         history.count > config.cut_step && break
         for (x_raw, y_raw) in train_loader
@@ -25,8 +25,12 @@ function train!(model::AbstractModule, ps::ParamsContainer,
             @timeit TO "Back Propagation" _train_step!(model, x, y, ps, opt_state, opt, history, config.config)
 
             if config.show_times > 0 && mod(mod(history.count - 1, total_loaders) + 1, config.show_times) == 0
+                current_time = time()
+                elapsed = current_time - last_show_time
                 print("Epoch $(epoch) [$(mod(history.count-1, total_loaders) + 1)/$(total_loaders)] - ")
+                @printf("%.2fs - ", elapsed)
                 show(history)
+                last_show_time = current_time
             end
 
             history.count += 1

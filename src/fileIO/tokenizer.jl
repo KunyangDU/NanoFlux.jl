@@ -15,6 +15,9 @@ struct SimpleTokenizer{T,L}
     splitter::Function # 核心差异点: 切分逻辑
 end
 
+SimpleTokenizer(stoi::Dict{T, Int}, itos::Vector{T}, splitter::Function) where T = 
+    SimpleTokenizer{T, length(itos)}(stoi, itos, splitter)
+
 """
     build_tokenizer(text::String; mode=:char)
 
